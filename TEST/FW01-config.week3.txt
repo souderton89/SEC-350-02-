@@ -1,0 +1,35 @@
+set interfaces ethernet eth0 address '10.0.17.119/24'
+set interfaces ethernet eth0 description 'SEC350-WAN'
+set interfaces ethernet eth0 offload gro
+set interfaces ethernet eth0 offload gso
+set interfaces ethernet eth0 offload sg
+set interfaces ethernet eth0 offload tso
+set interfaces ethernet eth1 address '172.16.50.2/29'
+set interfaces ethernet eth1 description 'Hamed-DMZ'
+set interfaces ethernet eth2 address '172.16.150.2/24'
+set interfaces ethernet eth2 description 'Hamed-LAN'
+set nat source rule 10 description 'NAT FROM DMZ TO WAN'
+set nat source rule 10 outbound-interface name 'eth0'
+set nat source rule 10 source address '172.16.50.0/29'
+set nat source rule 10 translation address 'masquerade'
+set nat source rule 20 description 'NAT FROM LAN TO WAN'
+set nat source rule 20 outbound-interface name 'eth0'
+set nat source rule 20 source address '172.16.150.0/24'
+set nat source rule 20 translation address 'masquerade'
+set nat source rule 30 description 'NAT FROM MGMT TO WAN'
+set nat source rule 30 translation address 'masquerade'
+set protocols rip interface eth2
+set protocols rip network '172.16.50.0/29'
+set protocols static route 0.0.0.0/0 next-hop 10.0.17.2
+set service dns forwarding allow-from '172.16.50.0/29'
+set service dns forwarding allow-from '172.16.150.0/24'
+set service dns forwarding listen-address '172.16.50.2'
+set service dns forwarding listen-address '172.16.150.2'
+set service dns forwarding system
+set service ssh
+set system host-name 'FW01-Hamed'
+set system name-server '10.0.17.2'
+set system option reboot-on-upgrade-failure '5'
+set system syslog local facility all level 'info'
+set system syslog local facility local7 level 'debug'
+set system syslog remote 172.16.50.5 facility authpriv
