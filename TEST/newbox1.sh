@@ -7,6 +7,7 @@ trap 'echo "ERROR: line $LINENO: $BASH_COMMAND" >&2' ERR
 # ------------------------------------------------------------
 # System Setup Script (Integrated)
 # - User creation (RSA key-only / password users)
+# - User deletion (numbered list; blocks deleting current user)
 # - Sudoers (NOPASSWD optional)
 # - Hostname set
 # - Disable root SSH login (robust service detection)
@@ -19,7 +20,7 @@ trap 'echo "ERROR: line $LINENO: $BASH_COMMAND" >&2' ERR
 #         - Create README.md inside folder with: "hi from <short-hostname>"
 #         - Prompt for GitHub username + token
 #         - Store via credential.helper store
-#         - Ensure git user.name + user.email is configured (FIXES your error)
+#         - Ensure git user.name + user.email is configured
 #         - git add .
 #         - Prompt commit message
 #         - git commit -m "<message>"
@@ -160,6 +161,120 @@ remove_from_group_if_present() {
 }
 
 # -----------------------------
+# User deletion (numbered list)
+# -----------------------------
+get_current_login_user() {
+  local u=""
+  u="${SUDO_USER:-}"
+  if [[ -z "$u" ]]; then
+    u="$(logname 2>/dev/null || true)"
+  fi
+  echo "$u"
+}
+
+is_deletable_user() {
+  local user="$1"
+  local entry uid home
+  entry="$(getent passwd "$user" || true)"
+  [[ -n "$entry" ]] || return 1
+  uid="$(echo "$entry" | cut -d: -f3)"
+  home="$(echo "$entry" | cut -d: -f6)"
+
+  [[ "$user" != "root" ]] || return 1
+  [[ "$user" != "nobody" ]] || return 1
+  [[ "$user" != "nfsnobody" ]] || return 1
+
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$uid" -ge 1000 ]] || return 1
+  [[ "$home" == /home/* ]] || return 1
+  return 0
+}
+
+list_deletable_users() {
+  getent passwd | awk -F: '{print $1}' | while read -r u; do
+    if is_deletable_user "$u"; then
+      echo "$u"
+    fi
+  done
+}
+
+delete_user_by_name() {
+  local target="$1"
+
+  [[ -n "${target// }" ]] || { echo "ERROR: blank user."; return 1; }
+  [[ "$target" != "root" ]] || { echo "ERROR: will not delete root."; return 1; }
+  user_exists "$target" || { echo "ERROR: user '$target' not found."; return 1; }
+
+  pkill -u "$target" >/dev/null 2>&1 || true
+
+  # remove NOPASSWD line if present
+  remove_passwordless_sudo_if_present "$target"
+
+  if [[ "$OS_FAMILY" == "debian" ]] && command -v deluser &>/dev/null; then
+    deluser --remove-home "$target"
+  else
+    userdel -r "$target"
+  fi
+
+  echo "Deleted user: $target"
+}
+
+delete_users_menu() {
+  local current
+  current="$(get_current_login_user)"
+
+  echo
+  echo "=============================="
+  echo " Delete Users"
+  echo " Current login user: ${current:-<unknown>}"
+  echo "=============================="
+
+  mapfile -t users < <(list_deletable_users)
+
+  if [[ "${#users[@]}" -eq 0 ]]; then
+    echo "No deletable users found (UID>=1000, /home/*)."
+    return 0
+  fi
+
+  echo
+  echo "Select a user to delete:"
+  local i
+  for i in "${!users[@]}"; do
+    printf "%2d) %s\n" "$((i+1))" "${users[$i]}"
+  done
+  echo " 0) Cancel"
+  echo
+
+  local choice
+  read -r -p "Enter number: " choice
+
+  [[ "$choice" =~ ^[0-9]+$ ]] || { echo "Invalid number."; return 1; }
+  [[ "$choice" -ne 0 ]] || { echo "Canceled."; return 0; }
+  (( choice >= 1 && choice <= ${#users[@]} )) || { echo "Out of range."; return 1; }
+
+  local target="${users[$((choice-1))]}"
+
+  if [[ -n "${current:-}" && "$target" == "$current" ]]; then
+    echo "ERROR: You cannot delete the current user: $current"
+    return 1
+  fi
+  if [[ "$target" == "root" ]]; then
+    echo "ERROR: You cannot delete root."
+    return 1
+  fi
+
+  echo
+  echo "You selected: $target"
+  read -r -p "Type DELETE to confirm: " confirm
+  if [[ "$confirm" != "DELETE" ]]; then
+    echo "Canceled."
+    return 0
+  fi
+
+  delete_user_by_name "$target"
+}
+
+# -----------------------------
 # Repo helpers
 # -----------------------------
 install_git() {
@@ -227,7 +342,6 @@ prompt_github_creds_and_store() {
 }
 
 ensure_git_identity() {
-  # FIX: prevents "Author identity unknown" on git commit
   local u="$1"
 
   local name email
@@ -240,7 +354,6 @@ ensure_git_identity() {
 
   echo
   echo "Git needs your identity for commits (user.name + user.email)."
-  echo "This is why your commit failed before."
   echo
 
   if [[ -z "${name// }" ]]; then
@@ -277,9 +390,7 @@ ensure_hostname_dir_in_repo() {
   if [[ ! -d "$host_dir" ]]; then
     echo "Creating host directory in repo: $host_dir" >&2
     sudo -H -u "$u" mkdir -p "$host_dir"
-
     sudo -H -u "$u" bash -c "printf 'hi from %s\n' '$short_host' > '$host_dir/README.md'"
-
     echo "1"
     return 0
   fi
@@ -302,7 +413,6 @@ git_add_commit_and_push_prompted() {
     return 0
   fi
 
-  # MUST have user.name + user.email before committing
   ensure_git_identity "$u"
 
   local msg
@@ -859,7 +969,39 @@ configure_network() {
 }
 
 # -----------------------------
-# Menu
+# Submenu: User creation / deletion
+# -----------------------------
+user_management_menu() {
+  while true; do
+    echo
+    echo "=============================="
+    echo " User Creation / Deletion"
+    echo "=============================="
+    echo "1) Add RSA key-only ADMIN user (NOPASSWD sudo via /etc/sudoers.d/$SUDOERS_DROPIN_NAME)"
+    echo "2) Add RSA key-only NON-SUDO user"
+    echo "3) Add PASSWORD REGULAR user (no sudo)"
+    echo "4) Add PASSWORD SUDOER user (sudo requires password)"
+    echo "5) Delete users"
+    echo "6) Back"
+    echo
+
+    read -r -p "Choose an option [1-6]: " sub
+    echo
+
+    case "$sub" in
+      1) add_rsa_admin_user ;;
+      2) add_rsa_user_no_sudo ;;
+      3) add_password_user_no_sudo ;;
+      4) add_password_admin_user ;;
+      5) delete_users_menu ;;
+      6) return 0 ;;
+      *) echo "Invalid choice." ;;
+    esac
+  done
+}
+
+# -----------------------------
+# Main Menu
 # -----------------------------
 menu() {
   echo
@@ -867,29 +1009,23 @@ menu() {
   echo " System Setup Menu"
   echo " OS Detected: $OS_ID ($OS_FAMILY)"
   echo "=============================="
-  echo "1) Add RSA key-only ADMIN user (NOPASSWD sudo via /etc/sudoers.d/$SUDOERS_DROPIN_NAME)"
-  echo "2) Add RSA key-only NON-SUDO user"
-  echo "3) Add PASSWORD REGULAR user (no sudo)"
-  echo "4) Add PASSWORD SUDOER user (sudo requires password)"
-  echo "5) Set hostname"
-  echo "6) Disable root SSH login"
-  echo "7) Configure network (netplan OR nmtui/NetworkManager)"
-  echo "8) Install git + clone/pull repo + create host folder (if missing -> commit+push) + set authorized_keys (existing user)"
-  echo "9) Configure repo URL + public key path defaults"
-  echo "10) Exit"
+  echo "1) User creation / deletion"
+  echo "2) Set hostname"
+  echo "3) Disable root SSH login"
+  echo "4) Configure network (netplan OR nmtui/NetworkManager)"
+  echo "5) Install git + clone/pull repo + create host folder (if missing -> commit+push) + set authorized_keys (existing user)"
+  echo "6) Configure repo URL + public key path defaults"
+  echo "7) Exit"
   echo
-  read -r -p "Choose an option [1-10]: " choice
+  read -r -p "Choose an option [1-7]: " choice
   echo
 
   case "$choice" in
-    1) add_rsa_admin_user ;;
-    2) add_rsa_user_no_sudo ;;
-    3) add_password_user_no_sudo ;;
-    4) add_password_admin_user ;;
-    5) set_hostname ;;
-    6) disable_root_ssh ;;
-    7) configure_network ;;
-    8)
+    1) user_management_menu ;;
+    2) set_hostname ;;
+    3) disable_root_ssh ;;
+    4) configure_network ;;
+    5)
       read -r -p "Enter EXISTING username to configure repo+authorized_keys for: " u
       [[ -n "$u" ]] || { echo "Username cannot be blank."; return; }
       if ! user_exists "$u"; then
@@ -898,8 +1034,8 @@ menu() {
       fi
       bootstrap_git_repo_and_ssh_key "$u"
       ;;
-    9) configure_repo_settings ;;
-    10) echo "Exiting."; exit 0 ;;
+    6) configure_repo_settings ;;
+    7) echo "Exiting."; exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
 }
