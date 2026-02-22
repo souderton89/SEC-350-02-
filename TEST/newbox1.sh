@@ -115,7 +115,7 @@ clone_or_update_repo_for_user() {
   fi
 
   if [[ -d "$repo_dir/.git" ]]; then
-    echo "Repo already exists at $repo_dir — pulling latest..."
+    echo "Repo already exists at $repo_dir  pulling latest..."
     sudo -u "$u" git -C "$repo_dir" pull --ff-only
   elif [[ -e "$repo_dir" ]]; then
     echo "ERROR: $repo_dir exists but is not a git repo. Rename/remove it and retry."
@@ -438,7 +438,6 @@ valid_cidr() {
 }
 
 split_dns_to_yaml_list() {
-  # input: "10.0.5.5,1.1.1.1" or "10.0.5.5 1.1.1.1"
   local raw="$1"
   raw="${raw//,/ }"
   raw="$(echo "$raw" | xargs)"
@@ -453,29 +452,23 @@ split_dns_to_yaml_list() {
 }
 
 detect_network_tool() {
-  # Prefer netplan if it's installed + /etc/netplan exists
   if command -v netplan &>/dev/null && [[ -d /etc/netplan ]] && ls /etc/netplan/*.yaml &>/dev/null; then
     echo "netplan"
     return
   fi
-
-  # Prefer NetworkManager if it's active and nmcli exists
   if command -v nmcli &>/dev/null && systemctl is-active --quiet NetworkManager 2>/dev/null; then
     echo "nm"
     return
   fi
-
-  # Fallback: if nmtui exists, usually NetworkManager is intended
   if command -v nmtui &>/dev/null; then
     echo "nm"
     return
   fi
-
   echo "unknown"
 }
 
 configure_netplan_static() {
-  local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search_domain="$5"
+  local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search_domain="${5:-}"
   local dns_list
   dns_list="$(split_dns_to_yaml_list "$dns_raw")"
 
@@ -485,7 +478,8 @@ configure_netplan_static() {
   echo "Writing: $out_file"
   [[ -f "$out_file" ]] && cp -a "$out_file" "${out_file}.bak.$(date +%F-%H%M%S)"
 
-  cat >"$out_file" <<EOF
+  if [[ -n "${search_domain// }" ]]; then
+    cat >"$out_file" <<EOF
 network:
   version: 2
   ethernets:
@@ -500,6 +494,22 @@ network:
         addresses: [${dns_list}]
         search: [${search_domain}]
 EOF
+  else
+    cat >"$out_file" <<EOF
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      dhcp4: false
+      addresses:
+        - ${ipcidr}
+      routes:
+        - to: default
+          via: ${gw}
+      nameservers:
+        addresses: [${dns_list}]
+EOF
+  fi
 
   chmod 600 "$out_file"
 
@@ -524,10 +534,10 @@ nm_find_conn_for_iface() {
 }
 
 configure_nmcli_static() {
-  local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search_domain="$5"
+  local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search_domain="${5:-}"
   local dns_list
   dns_list="$(split_dns_to_yaml_list "$dns_raw")"
-  dns_list="${dns_list//, /,}"   # nmcli likes commas with no spaces: 1.1.1.1,8.8.8.8
+  dns_list="${dns_list//, /,}"
 
   echo "NetworkManager detected."
 
@@ -552,7 +562,14 @@ configure_nmcli_static() {
   nmcli con mod "$conn" ipv4.addresses "$ipcidr"
   nmcli con mod "$conn" ipv4.gateway "$gw"
   nmcli con mod "$conn" ipv4.dns "$dns_list"
-  nmcli con mod "$conn" ipv4.dns-search "$search_domain"
+
+  # OPTIONAL search domain (do not require)
+  if [[ -n "${search_domain// }" ]]; then
+    nmcli con mod "$conn" ipv4.dns-search "$search_domain"
+  else
+    nmcli con mod "$conn" ipv4.dns-search ""
+  fi
+
   nmcli con mod "$conn" ipv6.method ignore
 
   echo "Bringing connection up..."
@@ -591,8 +608,8 @@ configure_network() {
   read -r -p "DNS servers (comma or space separated, example 10.0.5.5,1.1.1.1): " dns
   [[ -n "${dns// }" ]] || { echo "ERROR: DNS cannot be blank."; return 1; }
 
-  read -r -p "Search domain (example hamed.local): " search
-  [[ -n "${search// }" ]] || { echo "ERROR: Search domain cannot be blank."; return 1; }
+  # OPTIONAL search domain (blank allowed)
+  read -r -p "Search domain (optional, example hamed.local) [press Enter to skip]: " search
 
   echo
   echo "About to apply:"
@@ -601,7 +618,7 @@ configure_network() {
   echo "  IP:     $ipcidr"
   echo "  GW:     $gw"
   echo "  DNS:    $dns"
-  echo "  Search: $search"
+  echo "  Search: ${search:-<none>}"
   echo
 
   read -r -p "Continue? [y/N]: " yn
