@@ -251,7 +251,6 @@ create_user_with_password() {
       echo "Set password for '$u':"
       passwd "$u"
     elif [[ "$OS_FAMILY" == "debian" ]]; then
-      # Interactive: prompts for password + user info
       adduser "$u"
       echo "Created user '$u' (adduser)."
     else
@@ -281,7 +280,6 @@ add_rsa_admin_user() {
   fi
 
   ensure_passwordless_sudo "$u"
-
   echo "Done. '$u' is RSA key-only AND is a sudo/admin user (NOPASSWD configured)."
 
   echo
@@ -350,9 +348,7 @@ add_password_admin_user() {
     add_to_group_if_needed "$u" "sudo"
   fi
 
-  # Ensure they do NOT get NOPASSWD in /etc/sudoers.d/classes
   remove_passwordless_sudo_if_present "$u"
-
   echo "Done. '$u' is a sudo/admin user (password required for sudo)."
 }
 
@@ -398,7 +394,6 @@ disable_root_ssh() {
   echo "Set: PermitRootLogin no"
   echo "Restarting SSH daemon..."
 
-  # More reliable service detection:
   if systemctl is-enabled --quiet sshd 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
     systemctl restart sshd
   elif systemctl is-enabled --quiet ssh 2>/dev/null || systemctl is-active --quiet ssh 2>/dev/null; then
@@ -415,6 +410,213 @@ disable_root_ssh() {
   echo "SSH service restarted."
 }
 
+# -----------------------------
+# NETWORK CONFIG (Netplan or NM)
+# -----------------------------
+
+default_iface() {
+  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+    | grep -Ev '^(lo|docker|br-|virbr|veth|tun|tap)' \
+    | head -n 1
+}
+
+valid_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+  done
+  return 0
+}
+
+valid_cidr() {
+  local cidr="$1"
+  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]] || return 1
+  local ip="${cidr%/*}"
+  valid_ipv4 "$ip"
+}
+
+split_dns_to_yaml_list() {
+  # input: "10.0.5.5,1.1.1.1" or "10.0.5.5 1.1.1.1"
+  local raw="$1"
+  raw="${raw//,/ }"
+  raw="$(echo "$raw" | xargs)"
+  local out=""
+  local d
+  for d in $raw; do
+    if valid_ipv4 "$d"; then
+      out+="${out:+, }$d"
+    fi
+  done
+  echo "$out"
+}
+
+detect_network_tool() {
+  # Prefer netplan if it's installed + /etc/netplan exists
+  if command -v netplan &>/dev/null && [[ -d /etc/netplan ]] && ls /etc/netplan/*.yaml &>/dev/null; then
+    echo "netplan"
+    return
+  fi
+
+  # Prefer NetworkManager if it's active and nmcli exists
+  if command -v nmcli &>/dev/null && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    echo "nm"
+    return
+  fi
+
+  # Fallback: if nmtui exists, usually NetworkManager is intended
+  if command -v nmtui &>/dev/null; then
+    echo "nm"
+    return
+  fi
+
+  echo "unknown"
+}
+
+configure_netplan_static() {
+  local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search_domain="$5"
+  local dns_list
+  dns_list="$(split_dns_to_yaml_list "$dns_raw")"
+
+  local out_file="/etc/netplan/99-static-${iface}.yaml"
+
+  echo "Netplan detected."
+  echo "Writing: $out_file"
+  [[ -f "$out_file" ]] && cp -a "$out_file" "${out_file}.bak.$(date +%F-%H%M%S)"
+
+  cat >"$out_file" <<EOF
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      dhcp4: false
+      addresses:
+        - ${ipcidr}
+      routes:
+        - to: default
+          via: ${gw}
+      nameservers:
+        addresses: [${dns_list}]
+        search: [${search_domain}]
+EOF
+
+  chmod 600 "$out_file"
+
+  echo "Running: netplan generate"
+  netplan generate
+  echo "Running: netplan apply"
+  netplan apply
+
+  echo "Netplan applied."
+}
+
+nm_find_conn_for_iface() {
+  local iface="$1"
+  local conn=""
+
+  conn="$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: -v i="$iface" '$2==i{print $1; exit}')" || true
+  if [[ -z "$conn" ]]; then
+    conn="$(nmcli -t -f NAME,DEVICE con show 2>/dev/null | awk -F: -v i="$iface" '$2==i{print $1; exit}')" || true
+  fi
+
+  echo "$conn"
+}
+
+configure_nmcli_static() {
+  local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search_domain="$5"
+  local dns_list
+  dns_list="$(split_dns_to_yaml_list "$dns_raw")"
+  dns_list="${dns_list//, /,}"   # nmcli likes commas with no spaces: 1.1.1.1,8.8.8.8
+
+  echo "NetworkManager detected."
+
+  if ! command -v nmcli &>/dev/null; then
+    echo "ERROR: nmcli not found, but NetworkManager config requested."
+    echo "Install NetworkManager tools or use netplan."
+    return 1
+  fi
+
+  local conn
+  conn="$(nm_find_conn_for_iface "$iface")"
+
+  if [[ -z "$conn" ]]; then
+    echo "No NM connection found for $iface. Creating one named '${iface}'..."
+    nmcli con add type ethernet ifname "$iface" con-name "$iface" >/dev/null
+    conn="$iface"
+  fi
+
+  echo "Using connection: $conn"
+
+  nmcli con mod "$conn" ipv4.method manual
+  nmcli con mod "$conn" ipv4.addresses "$ipcidr"
+  nmcli con mod "$conn" ipv4.gateway "$gw"
+  nmcli con mod "$conn" ipv4.dns "$dns_list"
+  nmcli con mod "$conn" ipv4.dns-search "$search_domain"
+  nmcli con mod "$conn" ipv6.method ignore
+
+  echo "Bringing connection up..."
+  nmcli con up "$conn"
+
+  echo "NetworkManager config applied."
+}
+
+configure_network() {
+  local tool
+  tool="$(detect_network_tool)"
+
+  if [[ "$tool" == "unknown" ]]; then
+    echo "ERROR: Could not detect netplan or NetworkManager (nmtui/nmcli)."
+    echo "Install netplan OR NetworkManager, then re-run."
+    return 1
+  fi
+
+  local def_if
+  def_if="$(default_iface)"
+  read -r -p "Interface name [default: ${def_if:-NONE}]: " iface
+  iface="${iface:-$def_if}"
+
+  if [[ -z "${iface:-}" ]]; then
+    echo "ERROR: Could not determine interface. Enter it manually (example: ens18)."
+    return 1
+  fi
+
+  local ipcidr gw dns search
+  read -r -p "Static IP/CIDR (example 10.0.5.93/24): " ipcidr
+  valid_cidr "$ipcidr" || { echo "ERROR: Invalid IP/CIDR: $ipcidr"; return 1; }
+
+  read -r -p "Gateway (example 10.0.5.2): " gw
+  valid_ipv4 "$gw" || { echo "ERROR: Invalid gateway: $gw"; return 1; }
+
+  read -r -p "DNS servers (comma or space separated, example 10.0.5.5,1.1.1.1): " dns
+  [[ -n "${dns// }" ]] || { echo "ERROR: DNS cannot be blank."; return 1; }
+
+  read -r -p "Search domain (example hamed.local): " search
+  [[ -n "${search// }" ]] || { echo "ERROR: Search domain cannot be blank."; return 1; }
+
+  echo
+  echo "About to apply:"
+  echo "  Tool:   $tool"
+  echo "  Iface:  $iface"
+  echo "  IP:     $ipcidr"
+  echo "  GW:     $gw"
+  echo "  DNS:    $dns"
+  echo "  Search: $search"
+  echo
+
+  read -r -p "Continue? [y/N]: " yn
+  if [[ "${yn,,}" != "y" ]]; then
+    echo "Canceled."
+    return
+  fi
+
+  if [[ "$tool" == "netplan" ]]; then
+    configure_netplan_static "$iface" "$ipcidr" "$gw" "$dns" "$search"
+  else
+    configure_nmcli_static "$iface" "$ipcidr" "$gw" "$dns" "$search"
+  fi
+}
+
 menu() {
   echo
   echo "=============================="
@@ -427,10 +629,11 @@ menu() {
   echo "4) Add PASSWORD SUDOER user (sudo requires password)"
   echo "5) Set hostname"
   echo "6) Disable root SSH login"
-  echo "7) Install git + clone repo + set authorized_keys (for an existing user)"
-  echo "8) Exit"
+  echo "7) Configure network (netplan OR nmtui/NetworkManager)"
+  echo "8) Install git + clone repo + set authorized_keys (for an existing user)"
+  echo "9) Exit"
   echo
-  read -r -p "Choose an option [1-8]: " choice
+  read -r -p "Choose an option [1-9]: " choice
   echo
 
   case "$choice" in
@@ -440,7 +643,8 @@ menu() {
     4) add_password_admin_user ;;
     5) set_hostname ;;
     6) disable_root_ssh ;;
-    7)
+    7) configure_network ;;
+    8)
       read -r -p "Enter EXISTING username to configure repo+authorized_keys for: " u
       [[ -n "$u" ]] || { echo "Username cannot be blank."; return; }
       if ! user_exists "$u"; then
@@ -449,7 +653,7 @@ menu() {
       fi
       bootstrap_git_repo_and_ssh_key "$u"
       ;;
-    8) echo "Exiting."; exit 0 ;;
+    9) echo "Exiting."; exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
 }
