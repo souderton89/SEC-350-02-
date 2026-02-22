@@ -54,53 +54,6 @@ valid_username() {
   [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
 }
 
-add_to_group_if_needed() {
-  local u="$1"
-  local grp="$2"
-
-  if id -nG "$u" | tr ' ' '\n' | grep -qx "$grp"; then
-    echo "User '$u' is already in group '$grp'."
-  else
-    usermod -aG "$grp" "$u"
-    echo "Added '$u' to group '$grp'."
-  fi
-}
-
-# --- Passwordless sudo via /etc/sudoers.d/classes ---
-ensure_passwordless_sudo() {
-  local u="$1"
-  local f="/etc/sudoers.d/${SUDOERS_DROPIN_NAME}"
-  local line="${u} ALL=(ALL) NOPASSWD: ALL"
-
-  # Create file if needed
-  if [[ ! -f "$f" ]]; then
-    touch "$f"
-    chmod 0440 "$f"
-  fi
-
-  # Ensure correct permissions (sudo requires 0440-ish)
-  chmod 0440 "$f"
-
-  # Add line if missing (idempotent)
-  if grep -qFx "$line" "$f"; then
-    echo "Passwordless sudo already set for '$u' in $f"
-  else
-    echo "$line" >> "$f"
-    echo "Added passwordless sudo for '$u' in $f"
-  fi
-
-  # Validate sudoers syntax safely (if visudo exists)
-  if command -v visudo &>/dev/null; then
-    if ! visudo -cf "$f" &>/dev/null; then
-      echo "ERROR: visudo check failed for $f. Reverting last change."
-      # Remove the line we just added (best effort)
-      sed -i "\#^${u}[[:space:]]\+ALL=(ALL)[[:space:]]\+NOPASSWD:[[:space:]]\+ALL\$#d" "$f"
-      visudo -cf "$f" &>/dev/null || true
-      return 1
-    fi
-  fi
-}
-
 install_git() {
   if command -v git &>/dev/null; then
     echo "Git is already installed."
@@ -180,7 +133,7 @@ setup_authorized_keys_from_repo() {
     echo "Here are some files inside the repo that look like keys (best guess):"
     find "$repo_dir" -maxdepth 4 -type f \( -name "*.pub" -o -iname "*key*" -o -iname "*id_rsa*" -o -iname "*ed25519*" \) 2>/dev/null | head -n 30 || true
     echo
-    echo "Tip: re-run and paste one of those relative paths (example: RW01-jumper/public-key/id_rsa.pub)"
+    echo "Tip: re-run and paste one of those relative paths."
     return 1
   fi
 
@@ -201,20 +154,67 @@ bootstrap_git_repo_and_ssh_key() {
   setup_authorized_keys_from_repo "$u"
 }
 
-add_admin_user_rhel() {
+# --- Passwordless sudo via /etc/sudoers.d/classes ---
+ensure_passwordless_sudo() {
+  local u="$1"
+  local f="/etc/sudoers.d/${SUDOERS_DROPIN_NAME}"
+  local line="${u} ALL=(ALL) NOPASSWD: ALL"
+
+  if [[ ! -f "$f" ]]; then
+    touch "$f"
+    chmod 0440 "$f"
+  fi
+  chmod 0440 "$f"
+
+  if grep -qFx "$line" "$f"; then
+    echo "Passwordless sudo already set for '$u' in $f"
+  else
+    echo "$line" >> "$f"
+    echo "Added passwordless sudo for '$u' in $f"
+  fi
+
+  if command -v visudo &>/dev/null; then
+    if ! visudo -cf "$f" &>/dev/null; then
+      echo "ERROR: visudo check failed for $f. Reverting last change."
+      sed -i "\#^${u}[[:space:]]\+ALL=(ALL)[[:space:]]\+NOPASSWD:[[:space:]]\+ALL\$#d" "$f"
+      visudo -cf "$f" &>/dev/null || true
+      return 1
+    fi
+  fi
+}
+
+add_to_group_if_needed() {
+  local u="$1"
+  local grp="$2"
+
+  if id -nG "$u" | tr ' ' '\n' | grep -qx "$grp"; then
+    echo "User '$u' is already in group '$grp'."
+  else
+    usermod -aG "$grp" "$u"
+    echo "Added '$u' to group '$grp'."
+  fi
+}
+
+prompt_username() {
+  local u
   read -r -p "Enter username to create: " u
-  [[ -n "$u" ]] || { echo "Username cannot be blank."; return; }
+  [[ -n "$u" ]] || { echo "Username cannot be blank."; return 1; }
 
   if [[ "$u" == "root" ]]; then
     echo "Refusing to modify/create 'root'."
-    return
+    return 1
   fi
 
   if ! valid_username "$u"; then
     echo "Invalid username. Use: lowercase letters/digits/_/- (start with letter or _). Max 32 chars."
-    return
+    return 1
   fi
 
+  echo "$u"
+}
+
+create_user_rhel_basic() {
+  local u="$1"
   if user_exists "$u"; then
     echo "User '$u' already exists. Skipping creation."
   else
@@ -224,13 +224,29 @@ add_admin_user_rhel() {
 
   echo "Set password for '$u':"
   passwd "$u"
+}
+
+create_user_debian_basic() {
+  local u="$1"
+
+  if user_exists "$u"; then
+    echo "User '$u' already exists. Skipping creation."
+  else
+    adduser "$u"   # interactive
+    echo "Created user '$u' (adduser)."
+  fi
+}
+
+add_admin_user_rhel() {
+  local u
+  u="$(prompt_username)" || return
+
+  create_user_rhel_basic "$u"
 
   add_to_group_if_needed "$u" "wheel"
-
-  # Passwordless sudo via /etc/sudoers.d/classes
   ensure_passwordless_sudo "$u"
 
-  echo "Done. '$u' is now an admin user (wheel) and has NOPASSWD sudo via /etc/sudoers.d/$SUDOERS_DROPIN_NAME."
+  echo "Done. '$u' is admin (wheel) and has NOPASSWD sudo via /etc/sudoers.d/$SUDOERS_DROPIN_NAME."
 
   echo
   read -r -p "Also install git, clone repo, and set authorized_keys now? [y/N]: " yn
@@ -240,39 +256,44 @@ add_admin_user_rhel() {
 }
 
 add_admin_user_debian() {
-  read -r -p "Enter username to create: " u
-  [[ -n "$u" ]] || { echo "Username cannot be blank."; return; }
+  local u
+  u="$(prompt_username)" || return
 
-  if [[ "$u" == "root" ]]; then
-    echo "Refusing to modify/create 'root'."
-    return
-  fi
-
-  if ! valid_username "$u"; then
-    echo "Invalid username. Use: lowercase letters/digits/_/- (start with letter or _). Max 32 chars."
-    return
-  fi
-
-  # Ensure sudo exists on minimal installs
   if ! command -v sudo &>/dev/null; then
     echo "sudo not found. Installing..."
     apt-get update
     apt-get install -y sudo
   fi
 
-  if user_exists "$u"; then
-    echo "User '$u' already exists. Skipping creation."
-  else
-    adduser "$u"
-    echo "Created user '$u' (adduser)."
-  fi
+  create_user_debian_basic "$u"
 
   add_to_group_if_needed "$u" "sudo"
-
-  # Passwordless sudo via /etc/sudoers.d/classes
   ensure_passwordless_sudo "$u"
 
-  echo "Done. '$u' is now an admin user (sudo) and has NOPASSWD sudo via /etc/sudoers.d/$SUDOERS_DROPIN_NAME."
+  echo "Done. '$u' is admin (sudo) and has NOPASSWD sudo via /etc/sudoers.d/$SUDOERS_DROPIN_NAME."
+
+  echo
+  read -r -p "Also install git, clone repo, and set authorized_keys now? [y/N]: " yn
+  if [[ "${yn,,}" == "y" ]]; then
+    bootstrap_git_repo_and_ssh_key "$u"
+  fi
+}
+
+# NEW: create a NON-sudo user (still sets password, but does NOT add admin groups or sudoers file)
+add_regular_user() {
+  local u
+  u="$(prompt_username)" || return
+
+  if [[ "$OS_FAMILY" == "rhel" ]]; then
+    create_user_rhel_basic "$u"
+  elif [[ "$OS_FAMILY" == "debian" ]]; then
+    create_user_debian_basic "$u"
+  else
+    echo "ERROR: Unsupported OS (ID=$OS_ID)."
+    return 1
+  fi
+
+  echo "Done. '$u' is a regular (non-sudo) user."
 
   echo
   read -r -p "Also install git, clone repo, and set authorized_keys now? [y/N]: " yn
@@ -338,12 +359,13 @@ menu() {
   echo " OS Detected: $OS_ID ($OS_FAMILY)"
   echo "=============================="
   echo "1) Add a sudo/admin user (also writes /etc/sudoers.d/$SUDOERS_DROPIN_NAME for NOPASSWD)"
-  echo "2) Set hostname"
-  echo "3) Disable root SSH login"
-  echo "4) Install git + clone repo + set authorized_keys (for an existing user)"
-  echo "5) Exit"
+  echo "2) Create a regular user (NOT sudo/admin)"
+  echo "3) Set hostname"
+  echo "4) Disable root SSH login"
+  echo "5) Install git + clone repo + set authorized_keys (for an existing user)"
+  echo "6) Exit"
   echo
-  read -r -p "Choose an option [1-5]: " choice
+  read -r -p "Choose an option [1-6]: " choice
   echo
 
   case "$choice" in
@@ -357,12 +379,15 @@ menu() {
       fi
       ;;
     2)
-      set_hostname
+      add_regular_user
       ;;
     3)
-      disable_root_ssh
+      set_hostname
       ;;
     4)
+      disable_root_ssh
+      ;;
+    5)
       read -r -p "Enter EXISTING username to configure repo+authorized_keys for: " u
       [[ -n "$u" ]] || { echo "Username cannot be blank."; return; }
       if ! user_exists "$u"; then
@@ -371,7 +396,7 @@ menu() {
       fi
       bootstrap_git_repo_and_ssh_key "$u"
       ;;
-    5)
+    6)
       echo "Exiting."
       exit 0
       ;;
