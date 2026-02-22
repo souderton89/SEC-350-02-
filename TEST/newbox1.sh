@@ -1,11 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Repo + key defaults ---
+# If something dies, show the exact command + line
+trap 'echo "ERROR: line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# ------------------------------------------------------------
+# System Setup Script (Integrated)
+# - User creation (RSA key-only / password users)
+# - Sudoers (NOPASSWD optional)
+# - Hostname set
+# - Disable root SSH login (robust service detection)
+# - Network config (netplan OR NetworkManager)
+# - Git bootstrap:
+#     * Configure repo URL + key path (persisted)
+#     * Clone/pull repo
+#     * Create hostname folder inside repo (hostname BEFORE first '-')
+#     * If folder was created:
+#         - Create README.md inside folder with: "hi from <short-hostname>"
+#         - Prompt for GitHub username + token
+#         - Store via credential.helper store
+#         - Ensure git user.name + user.email is configured (FIXES your error)
+#         - git add .
+#         - Prompt commit message
+#         - git commit -m "<message>"
+#         - git push (as target Linux user)
+# ------------------------------------------------------------
+
+# --- Repo + key defaults (can be changed via menu + persisted) ---
 REPO_URL="https://github.com/souderton89/SEC-350-02-.git"
 REPO_DIR_NAME="SEC-350-02-"                              # folder name on disk after clone
-DEFAULT_KEY_REL_PATH="RW01-jumper/debian/hamed_bar.pub"  # path INSIDE repo to public key
+DEFAULT_KEY_REL_PATH="RW01-jumper/debian/hamed_bar.pub"   # path INSIDE repo to public key
 SUDOERS_DROPIN_NAME="classes"                            # /etc/sudoers.d/classes
+
+# Persist repo/key defaults here:
+CONFIG_FILE="/etc/system-setup.conf"
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -40,6 +68,55 @@ detect_os() {
   esac
 }
 
+# -----------------------------
+# Config load/save (repo defaults)
+# -----------------------------
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_config() {
+  umask 077
+  cat >"$CONFIG_FILE" <<EOF
+REPO_URL="${REPO_URL}"
+REPO_DIR_NAME="${REPO_DIR_NAME}"
+DEFAULT_KEY_REL_PATH="${DEFAULT_KEY_REL_PATH}"
+EOF
+  echo "Saved config to $CONFIG_FILE"
+}
+
+configure_repo_settings() {
+  echo
+  echo "=============================="
+  echo " Repo + Key Settings"
+  echo "=============================="
+  echo "Current REPO_URL:           $REPO_URL"
+  read -r -p "New REPO_URL (Enter to keep): " new_repo
+  if [[ -n "${new_repo// }" ]]; then
+    REPO_URL="$new_repo"
+  fi
+
+  echo "Current REPO_DIR_NAME:      $REPO_DIR_NAME"
+  read -r -p "New REPO_DIR_NAME (Enter to keep): " new_dir
+  if [[ -n "${new_dir// }" ]]; then
+    REPO_DIR_NAME="$new_dir"
+  fi
+
+  echo "Current DEFAULT_KEY_REL_PATH: $DEFAULT_KEY_REL_PATH"
+  read -r -p "New DEFAULT_KEY_REL_PATH (Enter to keep): " new_key
+  if [[ -n "${new_key// }" ]]; then
+    DEFAULT_KEY_REL_PATH="$new_key"
+  fi
+
+  save_config
+}
+
+# -----------------------------
+# User / groups helpers
+# -----------------------------
 user_exists() { id "$1" &>/dev/null; }
 
 valid_username() {
@@ -82,7 +159,9 @@ remove_from_group_if_present() {
   fi
 }
 
-# --- Repo helpers ---
+# -----------------------------
+# Repo helpers
+# -----------------------------
 install_git() {
   if command -v git &>/dev/null; then
     echo "Git is already installed."
@@ -102,6 +181,146 @@ install_git() {
   echo "Git installed."
 }
 
+get_machine_hostname() {
+  hostnamectl --static 2>/dev/null || hostname
+}
+
+get_short_hostname() {
+  local full
+  full="$(get_machine_hostname)"
+  echo "${full%%-*}"
+}
+
+repo_host_from_url() {
+  local url="$1"
+  local host
+  host="$(echo "$url" | sed -E 's#^https?://([^/]+)/.*$#\1#' 2>/dev/null || true)"
+  [[ -n "${host:-}" && "$host" != "$url" ]] && echo "$host" || echo "github.com"
+}
+
+prompt_github_creds_and_store() {
+  local u="$1"
+
+  echo
+  echo "GitHub credential setup (stores like your screenshot)."
+  echo
+
+  local gh_user token
+  read -r -p "Enter GitHub username: " gh_user
+  [[ -n "${gh_user// }" ]] || { echo "ERROR: GitHub username cannot be blank."; return 1; }
+
+  read -rsp "Enter GitHub token (hidden input): " token
+  echo
+  [[ -n "${token// }" ]] || { echo "ERROR: Token cannot be blank."; return 1; }
+
+  sudo -H -u "$u" git config --global credential.helper store
+
+  local host
+  host="$(repo_host_from_url "$REPO_URL")"
+
+  printf "protocol=https\nhost=%s\nusername=%s\npassword=%s\n\n" \
+    "$host" "$gh_user" "$token" \
+    | sudo -H -u "$u" git credential approve
+
+  echo "Credentials stored for user '$u' (helper=store)."
+  echo "File: /home/$u/.git-credentials"
+}
+
+ensure_git_identity() {
+  # FIX: prevents "Author identity unknown" on git commit
+  local u="$1"
+
+  local name email
+  name="$(sudo -H -u "$u" git config --global --get user.name 2>/dev/null || true)"
+  email="$(sudo -H -u "$u" git config --global --get user.email 2>/dev/null || true)"
+
+  if [[ -n "${name// }" && -n "${email// }" ]]; then
+    return 0
+  fi
+
+  echo
+  echo "Git needs your identity for commits (user.name + user.email)."
+  echo "This is why your commit failed before."
+  echo
+
+  if [[ -z "${name// }" ]]; then
+    read -r -p "Enter git user.name (example: Hamed): " name
+    [[ -n "${name// }" ]] || { echo "ERROR: user.name cannot be blank."; return 1; }
+    sudo -H -u "$u" git config --global user.name "$name"
+  fi
+
+  if [[ -z "${email// }" ]]; then
+    read -r -p "Enter git user.email (example: you@example.com): " email
+    [[ -n "${email// }" ]] || { echo "ERROR: user.email cannot be blank."; return 1; }
+    sudo -H -u "$u" git config --global user.email "$email"
+  fi
+
+  echo "Git identity set for user '$u':"
+  echo "  user.name  = $(sudo -H -u "$u" git config --global --get user.name)"
+  echo "  user.email = $(sudo -H -u "$u" git config --global --get user.email)"
+}
+
+ensure_hostname_dir_in_repo() {
+  local u="$1"
+  local repo_dir="$2"
+  local short_host
+  short_host="$(get_short_hostname)"
+
+  if [[ -z "${short_host// }" ]]; then
+    echo "WARNING: Could not determine short hostname; skipping host directory creation." >&2
+    echo "0"
+    return 0
+  fi
+
+  local host_dir="$repo_dir/$short_host"
+
+  if [[ ! -d "$host_dir" ]]; then
+    echo "Creating host directory in repo: $host_dir" >&2
+    sudo -H -u "$u" mkdir -p "$host_dir"
+
+    sudo -H -u "$u" bash -c "printf 'hi from %s\n' '$short_host' > '$host_dir/README.md'"
+
+    echo "1"
+    return 0
+  fi
+
+  echo "Host directory already exists: $host_dir" >&2
+  echo "0"
+  return 0
+}
+
+git_add_commit_and_push_prompted() {
+  local u="$1"
+  local repo_dir="$2"
+
+  echo
+  echo "Running: git add ."
+  sudo -H -u "$u" git -C "$repo_dir" add .
+
+  if sudo -H -u "$u" git -C "$repo_dir" diff --cached --quiet; then
+    echo "No staged changes to commit."
+    return 0
+  fi
+
+  # MUST have user.name + user.email before committing
+  ensure_git_identity "$u"
+
+  local msg
+  read -r -p "Enter commit message: " msg
+  [[ -n "${msg// }" ]] || { echo "ERROR: Commit message cannot be blank."; return 1; }
+
+  echo "Running: git commit -m \"$msg\""
+  sudo -H -u "$u" git -C "$repo_dir" commit -m "$msg"
+
+  local branch
+  branch="$(sudo -H -u "$u" git -C "$repo_dir" rev-parse --abbrev-ref HEAD)"
+
+  echo "Pushing to origin/$branch ..."
+  sudo -H -u "$u" git -C "$repo_dir" push -u origin "$branch"
+
+  echo "Commit + push complete."
+}
+
 clone_or_update_repo_for_user() {
   local u="$1"
   local home_dir="/home/$u"
@@ -116,17 +335,25 @@ clone_or_update_repo_for_user() {
 
   if [[ -d "$repo_dir/.git" ]]; then
     echo "Repo already exists at $repo_dir  pulling latest..."
-    sudo -u "$u" git -C "$repo_dir" pull --ff-only
+    sudo -H -u "$u" git -C "$repo_dir" pull --ff-only
   elif [[ -e "$repo_dir" ]]; then
     echo "ERROR: $repo_dir exists but is not a git repo. Rename/remove it and retry."
     return 1
   else
     echo "Cloning repo into $repo_dir ..."
-    sudo -u "$u" git clone "$REPO_URL" "$repo_dir"
+    sudo -H -u "$u" git clone "$REPO_URL" "$repo_dir"
   fi
+
+  local created
+  created="$(ensure_hostname_dir_in_repo "$u" "$repo_dir" | tail -n 1)"
 
   chown -R "$u:$u" "$repo_dir"
   echo "Repo ready."
+
+  if [[ "$created" == "1" ]]; then
+    prompt_github_creds_and_store "$u"
+    git_add_commit_and_push_prompted "$u" "$repo_dir"
+  fi
 }
 
 setup_authorized_keys_from_repo() {
@@ -223,7 +450,7 @@ remove_passwordless_sudo_if_present() {
   fi
 }
 
-# --- KEY-ONLY creation (teacher intent) ---
+# --- KEY-ONLY creation ---
 create_user_key_only() {
   local u="$1"
 
@@ -283,7 +510,7 @@ add_rsa_admin_user() {
   echo "Done. '$u' is RSA key-only AND is a sudo/admin user (NOPASSWD configured)."
 
   echo
-  read -r -p "Also install git, clone repo, and set authorized_keys now? [y/N]: " yn
+  read -r -p "Also install git, clone repo, set authorized_keys, and do hostname-folder commit+push if needed? [y/N]: " yn
   if [[ "${yn,,}" == "y" ]]; then
     bootstrap_git_repo_and_ssh_key "$u"
   fi
@@ -306,7 +533,7 @@ add_rsa_user_no_sudo() {
   echo "Done. '$u' is RSA key-only and NOT a sudo/admin user."
 
   echo
-  read -r -p "Also install git, clone repo, and set authorized_keys now? [y/N]: " yn
+  read -r -p "Also install git, clone repo, set authorized_keys, and do hostname-folder commit+push if needed? [y/N]: " yn
   if [[ "${yn,,}" == "y" ]]; then
     bootstrap_git_repo_and_ssh_key "$u"
   fi
@@ -413,7 +640,6 @@ disable_root_ssh() {
 # -----------------------------
 # NETWORK CONFIG (Netplan or NM)
 # -----------------------------
-
 default_iface() {
   ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
     | grep -Ev '^(lo|docker|br-|virbr|veth|tun|tap)' \
@@ -563,7 +789,6 @@ configure_nmcli_static() {
   nmcli con mod "$conn" ipv4.gateway "$gw"
   nmcli con mod "$conn" ipv4.dns "$dns_list"
 
-  # OPTIONAL search domain (do not require)
   if [[ -n "${search_domain// }" ]]; then
     nmcli con mod "$conn" ipv4.dns-search "$search_domain"
   else
@@ -608,7 +833,6 @@ configure_network() {
   read -r -p "DNS servers (comma or space separated, example 10.0.5.5,1.1.1.1): " dns
   [[ -n "${dns// }" ]] || { echo "ERROR: DNS cannot be blank."; return 1; }
 
-  # OPTIONAL search domain (blank allowed)
   read -r -p "Search domain (optional, example hamed.local) [press Enter to skip]: " search
 
   echo
@@ -634,6 +858,9 @@ configure_network() {
   fi
 }
 
+# -----------------------------
+# Menu
+# -----------------------------
 menu() {
   echo
   echo "=============================="
@@ -647,10 +874,11 @@ menu() {
   echo "5) Set hostname"
   echo "6) Disable root SSH login"
   echo "7) Configure network (netplan OR nmtui/NetworkManager)"
-  echo "8) Install git + clone repo + set authorized_keys (for an existing user)"
-  echo "9) Exit"
+  echo "8) Install git + clone/pull repo + create host folder (if missing -> commit+push) + set authorized_keys (existing user)"
+  echo "9) Configure repo URL + public key path defaults"
+  echo "10) Exit"
   echo
-  read -r -p "Choose an option [1-9]: " choice
+  read -r -p "Choose an option [1-10]: " choice
   echo
 
   case "$choice" in
@@ -670,7 +898,8 @@ menu() {
       fi
       bootstrap_git_repo_and_ssh_key "$u"
       ;;
-    9) echo "Exiting."; exit 0 ;;
+    9) configure_repo_settings ;;
+    10) echo "Exiting."; exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
 }
@@ -683,6 +912,8 @@ main() {
     echo "ERROR: Unsupported OS (ID=$OS_ID, ID_LIKE=$OS_LIKE)."
     exit 1
   fi
+
+  load_config
 
   while true; do
     menu
