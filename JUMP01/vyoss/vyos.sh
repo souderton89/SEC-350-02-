@@ -1,6 +1,6 @@
 #!/bin/vbash
 # vyos-dynamic-menu.sh
-# Dynamic CRUD menu for Firewall (ipv4 rulesets) + NAT + Interfaces
+# Dynamic CRUD menu for Firewall (ipv4 rulesets) + NAT + Interfaces + System (users + hostname)
 # Scans live config each time. No hardcoded rules.
 #
 # SAFETY GOALS:
@@ -21,22 +21,43 @@
 # PORTABILITY FIX:
 # - Does NOT rely on "mapfile/readarray". Uses a portable loader (works across VyOS variations).
 # - Forces ALL UI output/input through /dev/tty so menus never “disappear” on some VyOS builds.
+#
+# CONFIG SESSION FIX (IMPORTANT):
+# - Uses cli-shell-api sessions + my_* commands (modern + stable).
+#   Flow: getSessionEnv -> setupSession -> my_set/my_delete/my_commit -> teardownSession
+#   This avoids "without config session" and avoids broken legacy save script paths.
+
+TTY="/dev/tty"
+
+# Force script to run in vyattacfg group (fixes config session / permission weirdness)
+if [ "$(id -gn 2>/dev/null)" != "vyattacfg" ]; then
+  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  exec sg vyattacfg -c "/bin/vbash '$SCRIPT_PATH' $*"
+fi
 
 source /opt/vyatta/etc/functions/script-template
 
 # -----------------------------
 # TTY-safe IO (PORTABILITY FIX)
 # -----------------------------
-TTY="/dev/tty"
-
 tprint() { printf "%s\n" "$*" >"$TTY"; }
 tprintf() { printf "$@" >"$TTY"; }
 
+# -----------------------------
+# FIX: prevent VyOS completion crash in scripts
+# -----------------------------
+disable_completion_env() {
+  unset COMP_LINE COMP_POINT COMP_TYPE COMP_KEY COMP_WORDBREAKS 2>/dev/null || true
+  unset COMP_WORDS COMP_CWORD 2>/dev/null || true
+}
+
 tread() {
-  # usage: tread varname "Prompt"
   local __var="$1"; shift
   local __prompt="${1:-}"
   local __val=""
+
+  disable_completion_env
+
   if [ -n "$__prompt" ]; then
     read -r -p "$__prompt" __val <"$TTY"
   else
@@ -56,8 +77,6 @@ strip_quotes() {
 
 join_lines() { tr '\n' ' ' | sed 's/[[:space:]]*$//'; }
 
-# Portable: load command output into array name
-# usage: load_array myarr scan_firewall_rulesets
 load_array() {
   local __name="$1"; shift
   local line=""
@@ -67,9 +86,147 @@ load_array() {
   done < <("$@")
 }
 
+# ============================================================
+# API SESSION (FIXES: save script not found, remove-user crash)
+# ============================================================
+API_ACTIVE=0
+MY_SET=""
+MY_DELETE=""
+MY_COMMIT=""
+SAVE_BIN=""
+SAVE_CANDIDATES=()
+
+api_detect_bins() {
+  local SBIN="/opt/vyatta/sbin"
+
+  MY_SET="$SBIN/my_set"
+  MY_DELETE="$SBIN/my_delete"
+  MY_COMMIT="$SBIN/my_commit"
+
+  # SAVE varies by build. Auto-detect common candidates.
+  SAVE_CANDIDATES=(
+    "$SBIN/vyos-config-save"
+    "$SBIN/vyatta-save-config"
+    "$SBIN/vyos-save-config"
+    "$SBIN/vyos-save-config.py"
+    "/usr/libexec/vyos/vyos-config-save"
+    "/usr/libexec/vyos/vyos-save-config"
+    "/usr/libexec/vyos/vyos-save-config.py"
+    "/usr/lib/vyos/vyos-config-save"
+    "/usr/lib/vyos/vyos-save-config.py"
+  )
+
+  SAVE_BIN=""
+  local c
+  for c in "${SAVE_CANDIDATES[@]}"; do
+    if [ -x "$c" ]; then
+      SAVE_BIN="$c"
+      break
+    fi
+  done
+}
+
+api_begin() {
+  disable_completion_env
+  api_detect_bins
+
+  # Must have cli-shell-api + my_* tools
+  if ! command -v cli-shell-api >/dev/null 2>&1; then
+    tprint ""
+    tprint "ERROR: cli-shell-api not found. Cannot open API config session."
+    pause
+    return 1
+  fi
+  if [ ! -x "$MY_SET" ] || [ ! -x "$MY_DELETE" ] || [ ! -x "$MY_COMMIT" ]; then
+    tprint ""
+    tprint "ERROR: my_* commands not found in /opt/vyatta/sbin."
+    tprint "Expected:"
+    tprint "  /opt/vyatta/sbin/my_set"
+    tprint "  /opt/vyatta/sbin/my_delete"
+    tprint "  /opt/vyatta/sbin/my_commit"
+    pause
+    return 1
+  fi
+
+  # Build session environment for THIS process
+  local session_env
+  session_env="$(cli-shell-api getSessionEnv "$PPID" 2>/dev/null || true)"
+  if [ -z "$session_env" ]; then
+    tprint ""
+    tprint "ERROR: could not get session env (cli-shell-api getSessionEnv)."
+    pause
+    return 1
+  fi
+  eval "$session_env"
+
+  # Start session
+  if ! cli-shell-api setupSession <"$TTY" >"$TTY" 2>&1; then
+    tprint ""
+    tprint "ERROR: could not setupSession."
+    pause
+    return 1
+  fi
+
+  # Confirm session is active
+  cli-shell-api inSession >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    tprint ""
+    tprint "ERROR: API session is not active (inSession failed)."
+    cli-shell-api teardownSession >/dev/null 2>&1 || true
+    pause
+    return 1
+  fi
+
+  API_ACTIVE=1
+  return 0
+}
+
+api_end() {
+  disable_completion_env
+  if [ "$API_ACTIVE" -eq 1 ]; then
+    cli-shell-api teardownSession <"$TTY" >"$TTY" 2>&1 || true
+  fi
+  API_ACTIVE=0
+}
+
+# -----------------------------
+# SAFE WRAPPERS (DO NOT OVERRIDE set/delete/commit/save)
+# -----------------------------
+cfg_set() {
+  [ "$API_ACTIVE" -eq 1 ] || { tprint "ERROR: no API session (cfg_set)"; return 1; }
+  "$MY_SET" "$@"
+}
+cfg_delete() {
+  [ "$API_ACTIVE" -eq 1 ] || { tprint "ERROR: no API session (cfg_delete)"; return 1; }
+  "$MY_DELETE" "$@"
+}
+cfg_commit() {
+  [ "$API_ACTIVE" -eq 1 ] || { tprint "ERROR: no API session (cfg_commit)"; return 1; }
+  "$MY_COMMIT"
+}
+cfg_save() {
+  [ "$API_ACTIVE" -eq 1 ] || { tprint "ERROR: no API session (cfg_save)"; return 1; }
+  if [ -n "${SAVE_BIN:-}" ] && [ -x "$SAVE_BIN" ]; then
+    "$SAVE_BIN"
+    return $?
+  fi
+  tprint ""
+  tprint "ERROR: could not find a working save binary on this VyOS build."
+  tprint "Your changes ARE committed but not saved."
+  tprint "Run this and paste output:"
+  tprint "  ls -l /opt/vyatta/sbin | grep -i save"
+  return 1
+}
+
+# Keep names for your existing logic
+cfg_begin() { api_begin; }
+cfg_end() { api_end; }
+
+# --- EXTRA SAFETY (recommended): always tear down session on exit ---
+trap 'cfg_end >/dev/null 2>&1 || true' EXIT
+
 # ---- ACCESS CHECKS (prevents blank menus) ----
 get_cfg_cmds() {
-  # capture stderr too so we can detect permission errors
   run show configuration commands 2>&1
 }
 
@@ -120,7 +277,6 @@ show_detected_summary() {
   tprint ""
 }
 
-# Print a numbered menu and return selected item in SELECTED
 select_from_list() {
   local title="$1"; shift
   local arr=("$@")
@@ -182,11 +338,44 @@ confirm_commit_save() {
 
 cfg_apply() {
   if confirm_commit_save; then
-    commit
-    save
+    disable_completion_env
+
+    local out rc
+    out="$(cfg_commit <"$TTY" 2>&1)"
+    rc=$?
+
+    printf "%s\n" "$out" >"$TTY"
+
+    if echo "$out" | grep -qi "No configuration changes to commit"; then
+      tprint ""
+      tprint "NOTE: Nothing changed, so nothing to commit."
+      cfg_end
+      pause
+      return 0
+    fi
+
+    if [ $rc -ne 0 ]; then
+      tprint ""
+      tprint "ERROR: commit failed. Nothing was applied."
+      cfg_end
+      pause
+      return 1
+    fi
+
+    disable_completion_env
+    if ! cfg_save <"$TTY" >"$TTY" 2>&1; then
+      tprint ""
+      tprint "ERROR: save failed. Changes may be applied but not saved."
+      cfg_end
+      pause
+      return 1
+    fi
+
     tprint "DONE: committed + saved."
+    cfg_end
   else
     tprint "Not committed. (No changes saved.)"
+    cfg_end
   fi
   pause
   return 0
@@ -211,10 +400,7 @@ next_free_rule_number() {
   echo "$n"
 }
 
-require_numeric() {
-  local v="$1"
-  echo "$v" | grep -Eq '^[0-9]+$'
-}
+require_numeric() { echo "$1" | grep -Eq '^[0-9]+$'; }
 
 require_nonempty_list_or_return() {
   local label="$1"; shift
@@ -291,9 +477,7 @@ scan_eth_ifaces() {
     | sort -u
 }
 
-# ---- Zone-based firewall (A) scanning ----
 scan_fw_zones() {
-  # captures zone names from any "set firewall zone <ZONE> ..."
   get_cfg_cmds \
     | grep -F "set firewall zone " \
     | awk '{print $4}' \
@@ -301,8 +485,6 @@ scan_fw_zones() {
 }
 
 scan_zone_bindings() {
-  # outputs lines: TO|FROM|RULESET
-  # matches: set firewall zone <TO> from <FROM> firewall name <RULESET>
   get_cfg_cmds \
     | grep -F "set firewall zone " \
     | grep -F " from " \
@@ -318,18 +500,178 @@ scan_zone_bindings() {
 }
 
 binding_exists() {
-  # usage: binding_exists "TO" "FROM"  (return 0 if exists)
   local to="$1" from="$2"
   scan_zone_bindings | grep -F -q "${to}|${from}|"
 }
 
 binding_get_ruleset() {
-  # usage: binding_get_ruleset "TO" "FROM" => prints ruleset or blank
   local to="$1" from="$2"
   scan_zone_bindings \
     | grep -F "${to}|${from}|" \
     | head -n 1 \
     | awk -F'|' '{print $3}'
+}
+
+# -----------------------------
+# System: User + Hostname management
+# -----------------------------
+scan_login_users() {
+  get_cfg_cmds \
+    | grep -F "set system login user " \
+    | awk '{print $5}' \
+    | sort -u \
+    | while read -r u; do strip_quotes "$u"; done
+}
+
+get_current_username() { (id -un 2>/dev/null || true) | tr -d '\n'; }
+
+get_current_hostname() {
+  local hn
+  hn="$(run show configuration commands 2>/dev/null | grep -F "set system host-name " | head -n 1 | awk '{print $4}' || true)"
+  hn="$(strip_quotes "$hn")"
+  if [ -n "$hn" ]; then
+    echo "$hn"
+  else
+    (hostname 2>/dev/null || true)
+  fi
+}
+
+user_add_menu() {
+  local u pw fn
+  tprint ""
+  tprint "You selected: ADD user"
+  tprint "This will create: system login user <username> + password"
+  tprint ""
+
+  u="$(ask "Username (example: admin2)" "")"
+  [ -z "$u" ] && return 0
+
+  fn="$(ask "Full name (optional)" "")"
+  pw="$(ask "Password (plaintext) (will be hashed by VyOS)" "")"
+  [ -z "$pw" ] && tprint "Password required." && pause && return 0
+
+  tprint ""
+  tprint "SUMMARY:"
+  tprint "  username: $u"
+  [ -n "$fn" ] && tprint "  full-name: $fn"
+  tprint "  password: (set)"
+  tprint ""
+  pause
+
+  cfg_begin || return 0
+  [ -n "$fn" ] && cfg_set system login user "$u" full-name "$fn"
+  cfg_set system login user "$u" authentication plaintext-password "$pw"
+  cfg_apply
+}
+
+user_remove_menu() {
+  local users=() current target
+  load_array users scan_login_users
+
+  tprint ""
+  tprint "You selected: REMOVE user"
+  tprint "This will delete: system login user <username>"
+  tprint ""
+
+  require_nonempty_list_or_return "Configured login users" "${users[@]}" || return 0
+
+  current="$(get_current_username)"
+  [ -n "$current" ] && tprint "Current logged-in user: $current"
+
+  if select_from_list "Select user to REMOVE" "${users[@]}"; then
+    target="$SELECTED"
+  else
+    return 0
+  fi
+
+  if [ -n "$current" ] && [ "$target" = "$current" ]; then
+    tprint ""
+    tprint "ERROR: You cannot remove the user you are currently logged in as ($current)."
+    tprint "Log in as a different admin user first, then remove this user."
+    pause
+    return 0
+  fi
+
+  tprint ""
+  tprint "You are about to REMOVE user: $target"
+  tprint "--------------------------------------------------------"
+  (get_cfg_cmds | grep -F "set system login user '$target' " || true) >"$TTY"
+  (get_cfg_cmds | grep -F "set system login user $target " || true) >>"$TTY"
+  tprint "--------------------------------------------------------"
+  tprint ""
+  pause
+
+  cfg_begin || return 0
+  cfg_delete system login user "$target"
+  cfg_apply
+}
+
+users_menu() {
+  while true; do
+    tprint ""
+    tprint "===================="
+    tprint " User Management Menu"
+    tprint "===================="
+    tprint "Users detected (from config):"
+    local ulist=""
+    ulist="$(scan_login_users | join_lines)"
+    tprint "  ${ulist:-NONE}"
+    tprint ""
+    tprint "1) Add user"
+    tprint "2) Remove user"
+    tprint "3) Back"
+    local c
+    tread c "Select menu option #: "
+    case "$c" in
+      1) user_add_menu ;;
+      2) user_remove_menu ;;
+      3) return 0 ;;
+      *) tprint "Invalid." ;;
+    esac
+  done
+}
+
+hostname_menu() {
+  local cur newhn
+  tprint ""
+  tprint "===================="
+  tprint " Hostname Menu"
+  tprint "===================="
+  cur="$(get_current_hostname)"
+  tprint "Current hostname: ${cur:-UNKNOWN}"
+  tprint ""
+
+  newhn="$(ask "New hostname (example: vyos-edge01)" "")"
+  [ -z "$newhn" ] && return 0
+
+  tprint ""
+  tprint "You are setting system host-name to: $newhn"
+  tprint ""
+  pause
+
+  cfg_begin || return 0
+  cfg_set system host-name "$newhn"
+  cfg_apply
+}
+
+system_menu() {
+  while true; do
+    tprint ""
+    tprint "=================="
+    tprint " System Menu"
+    tprint "=================="
+    tprint "1) User management (add/remove)"
+    tprint "2) Change system hostname"
+    tprint "3) Back"
+    local c
+    tread c "Select menu option #: "
+    case "$c" in
+      1) users_menu ;;
+      2) hostname_menu ;;
+      3) return 0 ;;
+      *) tprint "Invalid." ;;
+    esac
+  done
 }
 
 # -----------------------------
@@ -435,7 +777,7 @@ fw_preview_rule() {
   tprint "Current config lines for: firewall ipv4 name '$rs' rule $n"
   tprint "--------------------------------------------------------"
   (get_cfg_cmds | grep -F "set firewall ipv4 name '$rs' rule $n " || true) >"$TTY"
-  (get_cfg_cmds | grep -F "set firewall ipv4 name $rs rule $n " || true) >"$TTY"
+  (get_cfg_cmds | grep -F "set firewall ipv4 name $rs rule $n " || true) >>"$TTY"
   tprint "--------------------------------------------------------"
   tprint ""
 }
@@ -453,7 +795,7 @@ fw_list_ruleset() {
   tprint "Showing commands for ruleset: $rs"
   tprint "--------------------------------------------------------"
   (get_cfg_cmds | grep -F "set firewall ipv4 name '$rs' " || true) >"$TTY"
-  (get_cfg_cmds | grep -F "set firewall ipv4 name $rs " || true) >"$TTY"
+  (get_cfg_cmds | grep -F "set firewall ipv4 name $rs " || true) >>"$TTY"
   tprint "--------------------------------------------------------"
   pause
 }
@@ -502,22 +844,22 @@ fw_add_rule_guided_safe() {
   tprint ""
   pause
 
-  configure
-  set firewall ipv4 name "$rs" rule "$n" action "$action"
-  [ -n "$desc" ] && set firewall ipv4 name "$rs" rule "$n" description "$desc"
+  cfg_begin || return 0
+  cfg_set firewall ipv4 name "$rs" rule "$n" action "$action"
+  [ -n "$desc" ] && cfg_set firewall ipv4 name "$rs" rule "$n" description "$desc"
 
   if [ -n "$proto" ] && [ "$proto" != "any" ]; then
-    set firewall ipv4 name "$rs" rule "$n" protocol "$proto"
+    cfg_set firewall ipv4 name "$rs" rule "$n" protocol "$proto"
   fi
 
-  [ -n "$saddr" ] && set firewall ipv4 name "$rs" rule "$n" source address "$saddr"
-  [ -n "$daddr" ] && set firewall ipv4 name "$rs" rule "$n" destination address "$daddr"
-  [ -n "$sport" ] && set firewall ipv4 name "$rs" rule "$n" source port "$sport"
-  [ -n "$dport" ] && set firewall ipv4 name "$rs" rule "$n" destination port "$dport"
+  [ -n "$saddr" ] && cfg_set firewall ipv4 name "$rs" rule "$n" source address "$saddr"
+  [ -n "$daddr" ] && cfg_set firewall ipv4 name "$rs" rule "$n" destination address "$daddr"
+  [ -n "$sport" ] && cfg_set firewall ipv4 name "$rs" rule "$n" source port "$sport"
+  [ -n "$dport" ] && cfg_set firewall ipv4 name "$rs" rule "$n" destination port "$dport"
 
-  [ "$state_est" = "y" ] || [ "$state_est" = "Y" ] && set firewall ipv4 name "$rs" rule "$n" state established
-  [ "$state_rel" = "y" ] || [ "$state_rel" = "Y" ] && set firewall ipv4 name "$rs" rule "$n" state related
-  [ "$state_new" = "y" ] || [ "$state_new" = "Y" ] && set firewall ipv4 name "$rs" rule "$n" state new
+  { [ "$state_est" = "y" ] || [ "$state_est" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state established
+  { [ "$state_rel" = "y" ] || [ "$state_rel" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state related
+  { [ "$state_new" = "y" ] || [ "$state_new" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state new
 
   cfg_apply
 }
@@ -553,9 +895,9 @@ fw_update_single_field() {
   val="$(ask "New value" "")"
   [ -z "$val" ] && return 0
 
-  configure
+  cfg_begin || return 0
   # shellcheck disable=SC2086
-  set firewall ipv4 name "$rs" rule "$n" $tail "$val"
+  cfg_set firewall ipv4 name "$rs" rule "$n" $tail "$val"
   cfg_apply
 }
 
@@ -573,8 +915,8 @@ fw_delete_rule() {
   n="$(fw_choose_rule_number_existing "$rs")" || return 0
   fw_preview_rule "$rs" "$n"
 
-  configure
-  delete firewall ipv4 name "$rs" rule "$n"
+  cfg_begin || return 0
+  cfg_delete firewall ipv4 name "$rs" rule "$n"
   cfg_apply
 }
 
@@ -668,8 +1010,8 @@ zone_add_binding_safe() {
   tprint ""
   pause
 
-  configure
-  set firewall zone "$to" from "$from" firewall name "$ruleset"
+  cfg_begin || return 0
+  cfg_set firewall zone "$to" from "$from" firewall name "$ruleset"
   cfg_apply
 }
 
@@ -711,8 +1053,8 @@ zone_update_binding_existing() {
   tprint ""
   pause
 
-  configure
-  set firewall zone "$to" from "$from" firewall name "$ruleset"
+  cfg_begin || return 0
+  cfg_set firewall zone "$to" from "$from" firewall name "$ruleset"
   cfg_apply
 }
 
@@ -741,8 +1083,8 @@ zone_delete_binding_existing() {
   zone_binding_preview "$to" "$from"
   pause
 
-  configure
-  delete firewall zone "$to" from "$from" firewall name
+  cfg_begin || return 0
+  cfg_delete firewall zone "$to" from "$from" firewall name
   cfg_apply
 }
 
@@ -929,13 +1271,13 @@ nat_add_dnat_guided() {
   tprint ""
   pause
 
-  configure
-  set nat destination rule "$n" description "$desc"
-  set nat destination rule "$n" inbound-interface name "$inif"
-  set nat destination rule "$n" protocol "$proto"
-  set nat destination rule "$n" destination port "$dport"
-  set nat destination rule "$n" translation address "$taddr"
-  set nat destination rule "$n" translation port "$tport"
+  cfg_begin || return 0
+  cfg_set nat destination rule "$n" description "$desc"
+  cfg_set nat destination rule "$n" inbound-interface name "$inif"
+  cfg_set nat destination rule "$n" protocol "$proto"
+  cfg_set nat destination rule "$n" destination port "$dport"
+  cfg_set nat destination rule "$n" translation address "$taddr"
+  cfg_set nat destination rule "$n" translation port "$tport"
   cfg_apply
 }
 
@@ -968,9 +1310,9 @@ nat_update_single_field() {
   val="$(ask "New value" "")"
   [ -z "$val" ] && return 0
 
-  configure
+  cfg_begin || return 0
   # shellcheck disable=SC2086
-  set nat "$type" rule "$n" $tail "$val"
+  cfg_set nat "$type" rule "$n" $tail "$val"
   cfg_apply
 }
 
@@ -986,8 +1328,8 @@ nat_delete_rule() {
   n="$(nat_choose_rule_number_existing "$type")" || return 0
 
   nat_preview_rule "$type" "$n"
-  configure
-  delete nat "$type" rule "$n"
+  cfg_begin || return 0
+  cfg_delete nat "$type" rule "$n"
   cfg_apply
 }
 
@@ -1056,9 +1398,9 @@ iface_set_ip() {
   tprint ""
   pause
 
-  configure
-  set interfaces ethernet "$iface" address "$ip"
-  [ -n "$desc" ] && set interfaces ethernet "$iface" description "$desc"
+  cfg_begin || return 0
+  cfg_set interfaces ethernet "$iface" address "$ip"
+  [ -n "$desc" ] && cfg_set interfaces ethernet "$iface" description "$desc"
   cfg_apply
 }
 
@@ -1118,8 +1460,15 @@ raw_mode() {
     *) tprint "Canceled."; pause; return 0 ;;
   esac
 
-  configure
-  eval "$cmd"
+  cfg_begin || return 0
+
+  # Use API wrappers for raw commands too (only set/delete supported here)
+  case "$cmd" in
+    set\ *)    eval "cfg_$cmd" ;;
+    delete\ *) eval "cfg_$cmd" ;;
+    *) tprint "ERROR: Raw mode only allows commands starting with 'set' or 'delete'."; cfg_end; pause; return 0 ;;
+  esac
+
   cfg_apply
 }
 
@@ -1138,9 +1487,10 @@ main_menu() {
     tprint "1) Interfaces submenu"
     tprint "2) Firewall submenu"
     tprint "3) NAT submenu"
-    tprint "4) Raw mode (set/delete anything)"
-    tprint "5) Show full config (commands)"
-    tprint "6) Exit"
+    tprint "4) System submenu (users + hostname)"
+    tprint "5) Raw mode (set/delete anything)"
+    tprint "6) Show full config (commands)"
+    tprint "7) Exit"
     tprint ""
     local c
     tread c "Select menu option #: "
@@ -1148,9 +1498,13 @@ main_menu() {
       1) iface_menu ;;
       2) firewall_menu ;;
       3) nat_menu ;;
-      4) raw_mode ;;
-      5) tprint ""; get_cfg_cmds >"$TTY"; tprint ""; pause ;;
-      6) exit 0 ;;
+      4) system_menu ;;
+      5) raw_mode ;;
+      6) tprint ""; get_cfg_cmds >"$TTY"; tprint ""; pause ;;
+      7)
+        cfg_end >/dev/null 2>&1 || true
+        builtin exit 0
+        ;;
       *) tprint "Invalid." ;;
     esac
   done
