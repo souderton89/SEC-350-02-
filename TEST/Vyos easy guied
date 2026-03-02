@@ -1,0 +1,77 @@
+
+Zone Firewall Binding Guide (VyOS) — simple version
+1) What a “binding” means
+
+This VyOS line:
+
+set firewall zone <TO> from <FROM> firewall name <RULESET>
+
+Means:
+
+Traffic coming FROM <FROM> and going TO <TO> uses <RULESET>.
+
+So think of it like:
+
+FROM → TO
+
+(But the command looks like TO <- FROM.)
+
+2) The easy way to pick zones
+
+Ask yourself two questions:
+
+Where is the traffic going? → that’s the TO zone
+
+Where is it coming from? → that’s the FROM zone
+
+Your script asking in this order is correct:
+TO zone → FROM zone → RULESET
+
+3) Examples
+Example A: ADMINS → WAN
+
+FROM = ADMINS
+
+TO = WAN
+
+Ruleset name should be: ADMINS-to-WAN
+
+Command becomes:
+
+set firewall zone WAN from ADMINS firewall name ADMINS-to-WAN
+Example B: WAN → ADMINS
+
+FROM = WAN
+
+TO = ADMINS
+
+Ruleset name should be: WAN-to-ADMINS
+
+Command becomes:
+
+set firewall zone ADMINS from WAN firewall name WAN-to-ADMINS
+4) Why it feels confusing
+
+Your ruleset names look like:
+
+FROM-to-TO (example: ADMINS-to-WAN)
+
+But the VyOS binding command is written like:
+
+TO … from FROM (looks reversed)
+
+They mean the same direction, just written differently.
+
+5) Quick trick so you don’t get mixed up
+
+When using the script, imagine:
+
+FROM → TO
+
+Then remember the command will look like:
+
+TO <- FROM
+
+Ruleset name should match the direction:
+
+FROM-to-TO
