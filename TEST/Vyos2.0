@@ -30,9 +30,18 @@
 TTY="/dev/tty"
 
 # Force script to run in vyattacfg group (fixes config session / permission weirdness)
+# FIX: preserve arguments safely (handles spaces/special chars)
 if [ "$(id -gn 2>/dev/null)" != "vyattacfg" ]; then
   SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-  exec sg vyattacfg -c "/bin/vbash '$SCRIPT_PATH' $*"
+
+  # Build a safely-quoted argument string for sg -c (bash-style quoting)
+  ARGS=""
+  for a in "$@"; do
+    ARGS="$ARGS $(printf "%q" "$a")"
+  done
+
+  # Quote the script path too
+  exec sg vyattacfg -c "/bin/vbash $(printf "%q" "$SCRIPT_PATH")$ARGS"
 fi
 
 source /opt/vyatta/etc/functions/script-template
@@ -66,6 +75,20 @@ tread() {
   printf -v "$__var" "%s" "$__val"
 }
 
+tread_secret() {
+  # Like tread, but hides input (password)
+  local __var="$1"; shift
+  local __prompt="${1:-Password: }"
+  local __val=""
+
+  disable_completion_env
+
+  # -s hides, -r raw, -p prompt
+  read -r -s -p "$__prompt" __val <"$TTY"
+  printf "\n" >"$TTY"
+  printf -v "$__var" "%s" "$__val"
+}
+
 pause() { tprint ""; local _; tread _ "Press Enter to continue..."; }
 
 strip_quotes() {
@@ -84,6 +107,74 @@ load_array() {
   while IFS= read -r line; do
     [ -n "$line" ] && eval "$__name+=(\"\$line\")"
   done < <("$@")
+}
+
+# -----------------------------
+# Input validation (NO OPEN-ENDED INPUT)
+# -----------------------------
+is_valid_username() {
+  # Linux-ish, safe for VyOS CLI tokens.
+  # starts with letter/_ then letters/numbers/_/.- ; length 1-32
+  echo "$1" | grep -Eq '^[A-Za-z_][A-Za-z0-9_.-]{0,31}$'
+}
+is_valid_hostname() {
+  # RFC-ish, no underscores; 1-253; labels 1-63; no leading/trailing '-'
+  local hn="$1"
+  [ -z "$hn" ] && return 1
+  [ "${#hn}" -gt 253 ] && return 1
+  echo "$hn" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+}
+is_valid_ipv4() {
+  local ip="$1"
+  echo "$ip" | awk -F. '
+    NF!=4{exit 1}
+    {for(i=1;i<=4;i++){ if($i!~/^[0-9]+$/) exit 1; if($i<0||$i>255) exit 1}}
+    END{exit 0}'
+}
+is_valid_cidr4() {
+  local cidr="$1"
+  echo "$cidr" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$' || return 1
+  local ip="${cidr%/*}"
+  is_valid_ipv4 "$ip"
+}
+is_valid_port_or_range() {
+  # 1-65535 or 1-65535-1-65535
+  local p="$1"
+  echo "$p" | grep -Eq '^[0-9]{1,5}(-[0-9]{1,5})?$' || return 1
+  local a="${p%%-*}"
+  local b=""
+  [ "$a" -ge 1 ] 2>/dev/null || return 1
+  [ "$a" -le 65535 ] 2>/dev/null || return 1
+  if echo "$p" | grep -q -- '-'; then
+    b="${p#*-}"
+    [ "$b" -ge 1 ] 2>/dev/null || return 1
+    [ "$b" -le 65535 ] 2>/dev/null || return 1
+    [ "$a" -le "$b" ] 2>/dev/null || return 1
+  fi
+  return 0
+}
+is_safe_ruleset_name() {
+  # Avoid breaking grep/awk and CLI tokens. Allow letters, numbers, underscore, dash, dot.
+  echo "$1" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$'
+}
+is_safe_iface_name() {
+  # eth0, eth1, bond0, etc. (simple)
+  echo "$1" | grep -Eq '^[A-Za-z0-9_.:-]{1,32}$'
+}
+is_safe_free_text() {
+  # For description/full-name: block control chars, pipes, backticks.
+  # Allow spaces, typical punctuation.
+  printf "%s" "$1" | grep -Eq '^[[:print:]]{1,128}$' && ! printf "%s" "$1" | grep -Eq '[`|]'
+}
+reject_if_unsafe_commandline() {
+  # Blocks shell metacharacters and quoting that our simple splitter can't safely preserve.
+  # This makes "raw mode" non-open-ended.
+  local s="$1"
+  printf "%s" "$s" | grep -Eq '[;&|`$<>()\\]' && return 0
+  printf "%s" "$s" | grep -Eq '[\r\n\t]' && return 0
+  # FIX: safe quote detection without breaking shell quoting
+  printf "%s" "$s" | grep -Eq "[\"']" && return 0
+  return 1
 }
 
 # ============================================================
@@ -149,8 +240,11 @@ api_begin() {
   fi
 
   # Build session environment for THIS process
-  local session_env
+  local session_env=""
   session_env="$(cli-shell-api getSessionEnv "$PPID" 2>/dev/null || true)"
+  if [ -z "$session_env" ]; then
+    session_env="$(cli-shell-api getSessionEnv "$$" 2>/dev/null || true)"
+  fi
   if [ -z "$session_env" ]; then
     tprint ""
     tprint "ERROR: could not get session env (cli-shell-api getSessionEnv)."
@@ -276,6 +370,8 @@ show_detected_summary() {
   tprint "  NAT source rules: ${ns:-NONE}"
   tprint ""
 }
+
+SELECTED=""
 
 select_from_list() {
   local title="$1"; shift
@@ -445,7 +541,7 @@ cfg_apply() {
     disable_completion_env
 
     local out rc
-    out="$(cfg_commit <"$TTY" 2>&1)"
+    out="$(cfg_commit 2>&1)"
     rc=$?
 
     printf "%s\n" "$out" >"$TTY"
@@ -642,6 +738,8 @@ get_current_hostname() {
 
 user_add_menu() {
   local u pw fn
+  local existing=() exists_yn
+
   tprint ""
   tprint "You selected: ADD user"
   tprint "This will create: system login user <username> + password"
@@ -650,9 +748,38 @@ user_add_menu() {
   u="$(ask "Username (example: admin2)" "")"
   [ -z "$u" ] && return 0
 
+  if ! is_valid_username "$u"; then
+    tprint ""
+    tprint "ERROR: Invalid username."
+    tprint "Allowed: letters/numbers/_/./- (must start with letter or _), max 32 chars."
+    pause
+    return 0
+  fi
+
+  load_array existing scan_login_users
+  if is_number_in_list "$u" "${existing[@]}"; then
+    tprint ""
+    tprint "ERROR: User already exists in config: $u"
+    tprint "ADD will NOT overwrite existing users."
+    tprint "Use REMOVE and then ADD if you really want to replace it."
+    pause
+    return 0
+  fi
+
   fn="$(ask "Full name (optional)" "")"
-  pw="$(ask "Password (plaintext) (will be hashed by VyOS)" "")"
-  [ -z "$pw" ] && tprint "Password required." && pause && return 0
+  if [ -n "$fn" ] && ! is_safe_free_text "$fn"; then
+    tprint ""
+    tprint "ERROR: Full name has unsupported characters."
+    pause
+    return 0
+  fi
+
+  tread_secret pw "Password (input hidden): "
+  if [ -z "$pw" ]; then
+    tprint "Password required."
+    pause
+    return 0
+  fi
 
   tprint ""
   tprint "SUMMARY:"
@@ -660,7 +787,8 @@ user_add_menu() {
   [ -n "$fn" ] && tprint "  full-name: $fn"
   tprint "  password: (set)"
   tprint ""
-  pause
+  exists_yn="$(choose_yes_no "Proceed to create this user?" "y" || echo "n")"
+  [ "$exists_yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   [ -n "$fn" ] && cfg_set system login user "$u" full-name "$fn"
@@ -703,7 +831,10 @@ user_remove_menu() {
   (get_cfg_cmds | grep -F "set system login user $target " || true) >>"$TTY"
   tprint "--------------------------------------------------------"
   tprint ""
-  pause
+
+  local yn
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete system login user "$target"
@@ -736,7 +867,7 @@ users_menu() {
 }
 
 hostname_menu() {
-  local cur newhn
+  local cur newhn yn
   tprint ""
   tprint "===================="
   tprint " Hostname Menu"
@@ -748,10 +879,19 @@ hostname_menu() {
   newhn="$(ask "New hostname (example: vyos-edge01)" "")"
   [ -z "$newhn" ] && return 0
 
+  if ! is_valid_hostname "$newhn"; then
+    tprint ""
+    tprint "ERROR: Invalid hostname."
+    tprint "Use letters/numbers and dashes; labels separated by dots; no underscores."
+    pause
+    return 0
+  fi
+
   tprint ""
   tprint "You are setting system host-name to: $newhn"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set system host-name "$newhn"
@@ -822,6 +962,15 @@ fw_choose_ruleset_or_new() {
   local rs
   rs="$(ask "Ruleset name (example: DMZ-to-LAN)" "")"
   [ -z "$rs" ] && return 1
+
+  if ! is_safe_ruleset_name "$rs"; then
+    tprint ""
+    tprint "ERROR: Invalid ruleset name."
+    tprint "Allowed: letters/numbers/_/./- (max 64)."
+    pause
+    return 1
+  fi
+
   echo "$rs"
 }
 
@@ -906,6 +1055,7 @@ fw_list_ruleset() {
 
 fw_add_rule_guided_safe() {
   local rs n action proto desc saddr daddr sport dport state_est state_rel state_new
+  local yn
 
   tprint ""
   tprint "You selected: ADD rule (SAFE - new only)"
@@ -927,10 +1077,35 @@ fw_add_rule_guided_safe() {
   proto="$(choose_fw_protocol "tcp")" || return 0
 
   desc="$(ask "Description (optional)" "")"
+  [ -n "$desc" ] && ! is_safe_free_text "$desc" && { tprint "ERROR: Description has unsupported characters."; pause; return 0; }
+
   saddr="$(ask "Source address (optional) (example: 172.16.50.0/29)" "")"
+  if [ -n "$saddr" ] && ! is_valid_cidr4 "$saddr" && ! is_valid_ipv4 "$saddr"; then
+    tprint "ERROR: Source address must be IPv4 or IPv4/CIDR."
+    pause
+    return 0
+  fi
+
   daddr="$(ask "Destination address (optional) (example: 172.16.200.10)" "")"
-  sport="$(ask "Source port (optional) (example: 443)" "")"
+  if [ -n "$daddr" ] && ! is_valid_cidr4 "$daddr" && ! is_valid_ipv4 "$daddr"; then
+    tprint "ERROR: Destination address must be IPv4 or IPv4/CIDR."
+    pause
+    return 0
+  fi
+
+  sport="$(ask "Source port (optional) (example: 443 or 1514-1515)" "")"
+  if [ -n "$sport" ] && ! is_valid_port_or_range "$sport"; then
+    tprint "ERROR: Source port must be 1-65535 or range like 1000-2000."
+    pause
+    return 0
+  fi
+
   dport="$(ask "Destination port (optional) (example: 22 or 1514-1515)" "")"
+  if [ -n "$dport" ] && ! is_valid_port_or_range "$dport"; then
+    tprint "ERROR: Destination port must be 1-65535 or range like 1000-2000."
+    pause
+    return 0
+  fi
 
   state_est="$(choose_yes_no "Match ESTABLISHED state?" "n" || echo "n")"
   state_rel="$(choose_yes_no "Match RELATED state?" "n" || echo "n")"
@@ -948,7 +1123,8 @@ fw_add_rule_guided_safe() {
   [ -n "$dport" ] && tprint "  destination port: $dport"
   [ -n "$desc" ] && tprint "  description: $desc"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed to create this rule?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set firewall ipv4 name "$rs" rule "$n" action "$action"
@@ -970,45 +1146,143 @@ fw_add_rule_guided_safe() {
   cfg_apply
 }
 
+# -----------------------------
+# FIX: Remove open-ended "Field path" updates.
+# Now: strict list of supported fields only.
+# -----------------------------
 fw_update_single_field() {
-  local rs n tail val
+  local rs n field val yn
+  local fields=("action" "description" "protocol" "source address" "source port" "destination address" "destination port" "state established" "state related" "state new" "back")
 
   tprint ""
   tprint "You selected: Update ONE field (existing rule)"
   tprint "Next steps:"
   tprint "  1) Select a ruleset"
   tprint "  2) Select an EXISTING rule number"
-  tprint "  3) Enter the field path + new value"
+  tprint "  3) Select the field to change (from a safe list)"
   tprint ""
 
   rs="$(fw_choose_ruleset_existing_only)" || return 0
   n="$(fw_choose_rule_number_existing "$rs")" || return 0
   fw_preview_rule "$rs" "$n"
 
-  tprint "Common field paths:"
-  tprint "  action"
-  tprint "  description"
-  tprint "  protocol"
-  tprint "  destination address"
-  tprint "  destination port"
-  tprint "  source address"
-  tprint "  source port"
-  tprint "  state established"
-  tprint ""
+  if ! select_from_list "Select field to update (safe list)" "${fields[@]}"; then
+    return 0
+  fi
+  field="$SELECTED"
+  [ "$field" = "back" ] && return 0
 
-  tail="$(ask "Field path (words after: rule <N>)" "")"
-  [ -z "$tail" ] && return 0
-  val="$(ask "New value" "")"
-  [ -z "$val" ] && return 0
-
-  cfg_begin || return 0
-  # shellcheck disable=SC2086
-  cfg_set firewall ipv4 name "$rs" rule "$n" $tail "$val"
-  cfg_apply
+  case "$field" in
+    action)
+      val="$(choose_fw_action "accept")" || return 0
+      cfg_begin || return 0
+      cfg_set firewall ipv4 name "$rs" rule "$n" action "$val"
+      cfg_apply
+      ;;
+    protocol)
+      val="$(choose_fw_protocol "tcp")" || return 0
+      cfg_begin || return 0
+      if [ "$val" = "any" ]; then
+        cfg_delete firewall ipv4 name "$rs" rule "$n" protocol
+      else
+        cfg_set firewall ipv4 name "$rs" rule "$n" protocol "$val"
+      fi
+      cfg_apply
+      ;;
+    description)
+      tprint ""
+      tprint "Leave blank to DELETE the description."
+      val="$(ask "New description" "")"
+      if [ -n "$val" ] && ! is_safe_free_text "$val"; then
+        tprint "ERROR: Description has unsupported characters."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        cfg_delete firewall ipv4 name "$rs" rule "$n" description
+      else
+        cfg_set firewall ipv4 name "$rs" rule "$n" description "$val"
+      fi
+      cfg_apply
+      ;;
+    "source address"|"destination address")
+      tprint ""
+      tprint "Leave blank to DELETE the address match."
+      val="$(ask "New IPv4 or IPv4/CIDR" "")"
+      if [ -n "$val" ] && ! is_valid_ipv4 "$val" && ! is_valid_cidr4 "$val"; then
+        tprint "ERROR: Must be IPv4 or IPv4/CIDR."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        if [ "$field" = "source address" ]; then
+          cfg_delete firewall ipv4 name "$rs" rule "$n" source address
+        else
+          cfg_delete firewall ipv4 name "$rs" rule "$n" destination address
+        fi
+      else
+        if [ "$field" = "source address" ]; then
+          cfg_set firewall ipv4 name "$rs" rule "$n" source address "$val"
+        else
+          cfg_set firewall ipv4 name "$rs" rule "$n" destination address "$val"
+        fi
+      fi
+      cfg_apply
+      ;;
+    "source port"|"destination port")
+      tprint ""
+      tprint "Leave blank to DELETE the port match."
+      val="$(ask "New port or range (example: 22 or 1514-1515)" "")"
+      if [ -n "$val" ] && ! is_valid_port_or_range "$val"; then
+        tprint "ERROR: Must be 1-65535 or range like 1000-2000."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        if [ "$field" = "source port" ]; then
+          cfg_delete firewall ipv4 name "$rs" rule "$n" source port
+        else
+          cfg_delete firewall ipv4 name "$rs" rule "$n" destination port
+        fi
+      else
+        if [ "$field" = "source port" ]; then
+          cfg_set firewall ipv4 name "$rs" rule "$n" source port "$val"
+        else
+          cfg_set firewall ipv4 name "$rs" rule "$n" destination port "$val"
+        fi
+      fi
+      cfg_apply
+      ;;
+    "state established"|"state related"|"state new")
+      yn="$(choose_yes_no "Set this state match ON?" "y" || echo "n")"
+      cfg_begin || return 0
+      if [ "$yn" = "y" ]; then
+        case "$field" in
+          "state established") cfg_set firewall ipv4 name "$rs" rule "$n" state established ;;
+          "state related")     cfg_set firewall ipv4 name "$rs" rule "$n" state related ;;
+          "state new")         cfg_set firewall ipv4 name "$rs" rule "$n" state new ;;
+        esac
+      else
+        case "$field" in
+          "state established") cfg_delete firewall ipv4 name "$rs" rule "$n" state established ;;
+          "state related")     cfg_delete firewall ipv4 name "$rs" rule "$n" state related ;;
+          "state new")         cfg_delete firewall ipv4 name "$rs" rule "$n" state new ;;
+        esac
+      fi
+      cfg_apply
+      ;;
+    *)
+      tprint "Invalid."
+      pause
+      ;;
+  esac
 }
 
 fw_delete_rule() {
-  local rs n
+  local rs n yn
 
   tprint ""
   tprint "You selected: Delete existing rule"
@@ -1020,6 +1294,9 @@ fw_delete_rule() {
   rs="$(fw_choose_ruleset_existing_only)" || return 0
   n="$(fw_choose_rule_number_existing "$rs")" || return 0
   fw_preview_rule "$rs" "$n"
+
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete firewall ipv4 name "$rs" rule "$n"
@@ -1076,7 +1353,7 @@ zone_list_bindings() {
 }
 
 zone_add_binding_safe() {
-  local to from ruleset existing_rs
+  local to from ruleset existing_rs yn
 
   tprint ""
   tprint "You selected: ADD zone binding (SAFE - will not overwrite)"
@@ -1114,7 +1391,8 @@ zone_add_binding_safe() {
   tprint "  FROM:    $from"
   tprint "  RULESET: $ruleset"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed to create this binding?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set firewall zone "$to" from "$from" firewall name "$ruleset"
@@ -1122,7 +1400,7 @@ zone_add_binding_safe() {
 }
 
 zone_update_binding_existing() {
-  local to from ruleset existing_rs
+  local to from ruleset existing_rs yn
 
   tprint ""
   tprint "You selected: UPDATE zone binding (existing only)"
@@ -1157,7 +1435,8 @@ zone_update_binding_existing() {
   tprint "  OLD:     ${existing_rs:-UNKNOWN}"
   tprint "  NEW:     $ruleset"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed with update?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set firewall zone "$to" from "$from" firewall name "$ruleset"
@@ -1165,7 +1444,7 @@ zone_update_binding_existing() {
 }
 
 zone_delete_binding_existing() {
-  local to from existing_rs
+  local to from existing_rs yn
 
   tprint ""
   tprint "You selected: DELETE zone binding (existing only)"
@@ -1187,7 +1466,9 @@ zone_delete_binding_existing() {
   tprint "You are deleting:"
   tprint "  $to <- $from  =  ${existing_rs:-UNKNOWN}"
   zone_binding_preview "$to" "$from"
-  pause
+
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete firewall zone "$to" from "$from" firewall name
@@ -1239,7 +1520,7 @@ firewall_menu() {
     tprint ""
     tprint "1) List ruleset (show commands)"
     tprint "2) ADD rule (SAFE - new only)"
-    tprint "3) Update ONE field in an existing rule"
+    tprint "3) Update ONE field in an existing rule (SAFE list)"
     tprint "4) Delete existing rule"
     tprint "5) Zone bindings (A: zone-based attach rulesets)"
     tprint "6) Back"
@@ -1315,6 +1596,7 @@ nat_add_dnat_guided() {
   local n desc inif proto dport taddr tport
   local used=() suggested
   local ifs=()
+  local yn
 
   tprint ""
   tprint "You selected: Add DNAT rule (SAFE - new only)"
@@ -1347,6 +1629,7 @@ nat_add_dnat_guided() {
   done
 
   desc="$(ask "Description (example: HTTP -> DMZ)" "DNAT")"
+  [ -n "$desc" ] && ! is_safe_free_text "$desc" && { tprint "ERROR: Description has unsupported characters."; pause; return 0; }
 
   load_array ifs scan_eth_ifaces
   require_nonempty_list_or_return "Ethernet interfaces (for inbound)" "${ifs[@]}" || return 0
@@ -1360,8 +1643,25 @@ nat_add_dnat_guided() {
   proto="$(choose_tcp_udp "tcp")" || return 0
 
   dport="$(ask "Public port (example: 80)" "80")"
+  if ! is_valid_port_or_range "$dport"; then
+    tprint "ERROR: Public port must be 1-65535 (or range)."
+    pause
+    return 0
+  fi
+
   taddr="$(ask "Inside IP (example: 172.16.50.3)" "172.16.50.3")"
+  if ! is_valid_ipv4 "$taddr"; then
+    tprint "ERROR: Inside IP must be valid IPv4."
+    pause
+    return 0
+  fi
+
   tport="$(ask "Inside port (example: 80)" "80")"
+  if ! is_valid_port_or_range "$tport"; then
+    tprint "ERROR: Inside port must be 1-65535 (or range)."
+    pause
+    return 0
+  fi
 
   tprint ""
   tprint "SUMMARY (DNAT rule $n):"
@@ -1371,7 +1671,8 @@ nat_add_dnat_guided() {
   tprint "  public port: $dport"
   tprint "  translation: $taddr:$tport"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed to create this DNAT rule?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set nat destination rule "$n" description "$desc"
@@ -1383,8 +1684,13 @@ nat_add_dnat_guided() {
   cfg_apply
 }
 
+# -----------------------------
+# FIX: Remove open-ended NAT "Field path" updates.
+# Now: strict list of supported fields only.
+# -----------------------------
 nat_update_single_field() {
-  local type n tail val
+  local type n field val yn
+  local fields=("description" "protocol" "destination port" "inbound-interface name" "outbound-interface name" "source address" "translation address" "translation port" "back")
 
   tprint ""
   tprint "You selected: Update ONE field in an existing NAT rule"
@@ -1396,30 +1702,124 @@ nat_update_single_field() {
 
   nat_preview_rule "$type" "$n"
 
-  tprint "Common field paths:"
-  tprint "  description"
-  tprint "  destination port"
-  tprint "  inbound-interface name"
-  tprint "  outbound-interface name"
-  tprint "  source address"
-  tprint "  protocol"
-  tprint "  translation address"
-  tprint "  translation port"
-  tprint ""
+  if ! select_from_list "Select field to update (safe list)" "${fields[@]}"; then
+    return 0
+  fi
+  field="$SELECTED"
+  [ "$field" = "back" ] && return 0
 
-  tail="$(ask "Field path (words after: rule <N>)" "")"
-  [ -z "$tail" ] && return 0
-  val="$(ask "New value" "")"
-  [ -z "$val" ] && return 0
-
-  cfg_begin || return 0
-  # shellcheck disable=SC2086
-  cfg_set nat "$type" rule "$n" $tail "$val"
-  cfg_apply
+  case "$field" in
+    description)
+      tprint ""
+      tprint "Leave blank to DELETE the description."
+      val="$(ask "New description" "")"
+      if [ -n "$val" ] && ! is_safe_free_text "$val"; then
+        tprint "ERROR: Description has unsupported characters."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        cfg_delete nat "$type" rule "$n" description
+      else
+        cfg_set nat "$type" rule "$n" description "$val"
+      fi
+      cfg_apply
+      ;;
+    protocol)
+      val="$(choose_fw_protocol "tcp")" || return 0
+      cfg_begin || return 0
+      if [ "$val" = "any" ]; then
+        cfg_delete nat "$type" rule "$n" protocol
+      else
+        cfg_set nat "$type" rule "$n" protocol "$val"
+      fi
+      cfg_apply
+      ;;
+    "destination port"|"translation port")
+      tprint ""
+      tprint "Leave blank to DELETE."
+      val="$(ask "New port or range (example: 80 or 1000-2000)" "")"
+      if [ -n "$val" ] && ! is_valid_port_or_range "$val"; then
+        tprint "ERROR: Must be 1-65535 or range like 1000-2000."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        if [ "$field" = "destination port" ]; then
+          cfg_delete nat "$type" rule "$n" destination port
+        else
+          cfg_delete nat "$type" rule "$n" translation port
+        fi
+      else
+        if [ "$field" = "destination port" ]; then
+          cfg_set nat "$type" rule "$n" destination port "$val"
+        else
+          cfg_set nat "$type" rule "$n" translation port "$val"
+        fi
+      fi
+      cfg_apply
+      ;;
+    "translation address"|"source address")
+      tprint ""
+      tprint "Leave blank to DELETE."
+      val="$(ask "New IPv4 or IPv4/CIDR" "")"
+      if [ -n "$val" ] && ! is_valid_ipv4 "$val" && ! is_valid_cidr4 "$val"; then
+        tprint "ERROR: Must be IPv4 or IPv4/CIDR."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        if [ "$field" = "translation address" ]; then
+          cfg_delete nat "$type" rule "$n" translation address
+        else
+          cfg_delete nat "$type" rule "$n" source address
+        fi
+      else
+        if [ "$field" = "translation address" ]; then
+          cfg_set nat "$type" rule "$n" translation address "$val"
+        else
+          cfg_set nat "$type" rule "$n" source address "$val"
+        fi
+      fi
+      cfg_apply
+      ;;
+    "inbound-interface name"|"outbound-interface name")
+      tprint ""
+      tprint "Leave blank to DELETE."
+      val="$(ask "Interface name (example: eth0)" "")"
+      if [ -n "$val" ] && ! is_safe_iface_name "$val"; then
+        tprint "ERROR: Invalid interface name."
+        pause
+        return 0
+      fi
+      cfg_begin || return 0
+      if [ -z "$val" ]; then
+        if [ "$field" = "inbound-interface name" ]; then
+          cfg_delete nat "$type" rule "$n" inbound-interface name
+        else
+          cfg_delete nat "$type" rule "$n" outbound-interface name
+        fi
+      else
+        if [ "$field" = "inbound-interface name" ]; then
+          cfg_set nat "$type" rule "$n" inbound-interface name "$val"
+        else
+          cfg_set nat "$type" rule "$n" outbound-interface name "$val"
+        fi
+      fi
+      cfg_apply
+      ;;
+    *)
+      tprint "Invalid."
+      pause
+      ;;
+  esac
 }
 
 nat_delete_rule() {
-  local type n
+  local type n yn
 
   tprint ""
   tprint "You selected: Delete existing NAT rule"
@@ -1430,6 +1830,9 @@ nat_delete_rule() {
   n="$(nat_choose_rule_number_existing "$type")" || return 0
 
   nat_preview_rule "$type" "$n"
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
   cfg_begin || return 0
   cfg_delete nat "$type" rule "$n"
   cfg_apply
@@ -1448,7 +1851,7 @@ nat_menu() {
     tprint ""
     tprint "1) List NAT (show commands)"
     tprint "2) Add DNAT rule (SAFE - new only)"
-    tprint "3) Update ONE field in an existing NAT rule"
+    tprint "3) Update ONE field in an existing NAT rule (SAFE list)"
     tprint "4) Delete existing NAT rule"
     tprint "5) Back"
     local c
@@ -1468,7 +1871,7 @@ nat_menu() {
 # Interfaces
 # -----------------------------
 iface_set_ip() {
-  local ifs=() iface ip desc
+  local ifs=() iface ip desc yn
 
   load_array ifs scan_eth_ifaces
 
@@ -1490,7 +1893,18 @@ iface_set_ip() {
 
   ip="$(ask "New address (CIDR) (example: 172.16.50.2/29)" "")"
   [ -z "$ip" ] && return 0
+  if ! is_valid_cidr4 "$ip"; then
+    tprint "ERROR: Address must be IPv4/CIDR like 192.168.1.1/24."
+    pause
+    return 0
+  fi
+
   desc="$(ask "Description (optional) (example: Hamed-DMZ)" "")"
+  if [ -n "$desc" ] && ! is_safe_free_text "$desc"; then
+    tprint "ERROR: Description has unsupported characters."
+    pause
+    return 0
+  fi
 
   tprint ""
   tprint "SUMMARY:"
@@ -1498,7 +1912,8 @@ iface_set_ip() {
   tprint "  address: $ip"
   [ -n "$desc" ] && tprint "  description: $desc"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed with interface update?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set interfaces ethernet "$iface" address "$ip"
@@ -1538,15 +1953,6 @@ iface_menu() {
 
 # ============================================================
 # DNS Forwarding (FIXED per your screenshots)
-# - VyOS validation requires BOTH:
-#     * at least one allow-from
-#     * at least one listen-address
-#   Otherwise commit fails (like your images).
-# - So:
-#     * Add allow-from will prompt to add listen-address if missing (same commit).
-#     * Add listen-address will prompt to add allow-from if missing (same commit).
-#     * Enabling "system" is its own option, but it will NOT run unless both exist.
-#     * Deleting the LAST required entry is BLOCKED (prevents commit failure).
 # ============================================================
 scan_dns_allow_from() {
   get_cfg_cmds \
@@ -1616,6 +2022,11 @@ dns_add_allow_from_safe() {
 
   new_af="$(ask "New allow-from subnet (CIDR) (example: 10.0.66.0/28)" "")"
   [ -z "$new_af" ] && return 0
+  if ! is_valid_cidr4 "$new_af"; then
+    tprint "ERROR: allow-from must be IPv4/CIDR like 10.0.0.0/24."
+    pause
+    return 0
+  fi
 
   if is_number_in_list "$new_af" "${current_af[@]}"; then
     tprint ""
@@ -1624,12 +2035,10 @@ dns_add_allow_from_safe() {
     return 0
   fi
 
-  # FIX for your screenshot:
-  # If there is NO listen-address yet, commit will fail unless we add one now.
   if [ "${#current_la[@]}" -eq 0 ]; then
     tprint ""
     tprint "IMPORTANT:"
-    tprint "  Your VyOS build will NOT commit DNS forwarding unless BOTH exist:"
+    tprint "  DNS forwarding commit will FAIL unless BOTH exist:"
     tprint "    - allow-from"
     tprint "    - listen-address"
     tprint ""
@@ -1637,6 +2046,11 @@ dns_add_allow_from_safe() {
     tprint ""
     la_needed="$(ask "Listen-address IP to add now (example: 10.0.66.2)" "")"
     [ -z "$la_needed" ] && return 0
+    if ! is_valid_ipv4 "$la_needed"; then
+      tprint "ERROR: listen-address must be valid IPv4."
+      pause
+      return 0
+    fi
   fi
 
   tprint ""
@@ -1644,7 +2058,8 @@ dns_add_allow_from_safe() {
   tprint "  add allow-from: $new_af"
   [ -n "${la_needed:-}" ] && tprint "  add listen-address (required): $la_needed"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set service dns forwarding allow-from "$new_af"
@@ -1654,7 +2069,7 @@ dns_add_allow_from_safe() {
 
 dns_delete_allow_from_existing() {
   local current_af=() current_la=() target
-  local la_count af_count
+  local la_count af_count yn
 
   load_array current_af scan_dns_allow_from
   load_array current_la scan_dns_listen_address
@@ -1674,8 +2089,6 @@ dns_delete_allow_from_existing() {
   af_count="${#current_af[@]}"
   la_count="${#current_la[@]}"
 
-  # BLOCK deleting the last allow-from if listen-address exists OR system enabled,
-  # because commit will fail (your screenshot shows it requires allow-from).
   if [ "$af_count" -le 1 ] && { [ "$la_count" -ge 1 ] || dns_system_is_enabled; }; then
     tprint ""
     tprint "BLOCKED (prevents commit failure):"
@@ -1689,10 +2102,8 @@ dns_delete_allow_from_existing() {
     return 0
   fi
 
-  tprint ""
-  tprint "You are deleting allow-from: $target"
-  tprint ""
-  pause
+  yn="$(choose_yes_no "Delete allow-from: $target ?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete service dns forwarding allow-from "$target"
@@ -1701,7 +2112,7 @@ dns_delete_allow_from_existing() {
 
 dns_add_listen_address_safe() {
   local current_af=() current_la=()
-  local new_la af_needed
+  local new_la af_needed yn
 
   load_array current_af scan_dns_allow_from
   load_array current_la scan_dns_listen_address
@@ -1714,6 +2125,11 @@ dns_add_listen_address_safe() {
 
   new_la="$(ask "New listen-address IP (example: 10.0.66.2)" "")"
   [ -z "$new_la" ] && return 0
+  if ! is_valid_ipv4 "$new_la"; then
+    tprint "ERROR: listen-address must be valid IPv4."
+    pause
+    return 0
+  fi
 
   if is_number_in_list "$new_la" "${current_la[@]}"; then
     tprint ""
@@ -1722,12 +2138,10 @@ dns_add_listen_address_safe() {
     return 0
   fi
 
-  # FIX for your screenshot:
-  # If there is NO allow-from yet, commit will fail unless we add one now.
   if [ "${#current_af[@]}" -eq 0 ]; then
     tprint ""
     tprint "IMPORTANT:"
-    tprint "  Your VyOS build will NOT commit DNS forwarding unless BOTH exist:"
+    tprint "  DNS forwarding commit will FAIL unless BOTH exist:"
     tprint "    - allow-from"
     tprint "    - listen-address"
     tprint ""
@@ -1735,6 +2149,11 @@ dns_add_listen_address_safe() {
     tprint ""
     af_needed="$(ask "Allow-from subnet (CIDR) to add now (example: 10.0.66.0/28)" "")"
     [ -z "$af_needed" ] && return 0
+    if ! is_valid_cidr4 "$af_needed"; then
+      tprint "ERROR: allow-from must be IPv4/CIDR."
+      pause
+      return 0
+    fi
   fi
 
   tprint ""
@@ -1742,7 +2161,8 @@ dns_add_listen_address_safe() {
   tprint "  add listen-address: $new_la"
   [ -n "${af_needed:-}" ] && tprint "  add allow-from (required): $af_needed"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set service dns forwarding listen-address "$new_la"
@@ -1752,7 +2172,7 @@ dns_add_listen_address_safe() {
 
 dns_delete_listen_address_existing() {
   local current_af=() current_la=() target
-  local la_count af_count
+  local la_count af_count yn
 
   load_array current_af scan_dns_allow_from
   load_array current_la scan_dns_listen_address
@@ -1772,8 +2192,6 @@ dns_delete_listen_address_existing() {
   af_count="${#current_af[@]}"
   la_count="${#current_la[@]}"
 
-  # BLOCK deleting the last listen-address if allow-from exists OR system enabled,
-  # because commit will fail (your screenshot shows it requires listen-address).
   if [ "$la_count" -le 1 ] && { [ "$af_count" -ge 1 ] || dns_system_is_enabled; }; then
     tprint ""
     tprint "BLOCKED (prevents commit failure):"
@@ -1787,10 +2205,8 @@ dns_delete_listen_address_existing() {
     return 0
   fi
 
-  tprint ""
-  tprint "You are deleting listen-address: $target"
-  tprint ""
-  pause
+  yn="$(choose_yes_no "Delete listen-address: $target ?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete service dns forwarding listen-address "$target"
@@ -1799,7 +2215,7 @@ dns_delete_listen_address_existing() {
 
 dns_system_forwarding_toggle() {
   local current_af=() current_la=()
-  local yn want_enable
+  local yn
 
   load_array current_af scan_dns_allow_from
   load_array current_la scan_dns_listen_address
@@ -1817,28 +2233,17 @@ dns_system_forwarding_toggle() {
     yn="$(choose_yes_no "Disable DNS system forwarding now?" "y" || echo "n")"
     [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
-    tprint ""
-    tprint "SUMMARY:"
-    tprint "  disable DNS system forwarding"
-    tprint ""
-    pause
-
     cfg_begin || return 0
     cfg_delete service dns forwarding system
     cfg_apply
     return 0
   fi
 
-  # Enabling: MUST have both allow-from and listen-address, or commit fails (your screenshot).
   if [ "${#current_la[@]}" -eq 0 ] || [ "${#current_af[@]}" -eq 0 ]; then
     tprint ""
-    tprint "CANNOT ENABLE (would fail commit on your VyOS build):"
+    tprint "CANNOT ENABLE (would fail commit):"
     [ "${#current_la[@]}" -eq 0 ] && tprint "  - Missing listen-address"
     [ "${#current_af[@]}" -eq 0 ] && tprint "  - Missing allow-from"
-    tprint ""
-    tprint "Do this first (in this submenu):"
-    tprint "  - Add allow-from"
-    tprint "  - Add listen-address"
     tprint ""
     pause
     return 0
@@ -1846,12 +2251,6 @@ dns_system_forwarding_toggle() {
 
   yn="$(choose_yes_no "Enable DNS system forwarding now?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-
-  tprint ""
-  tprint "SUMMARY:"
-  tprint "  enable DNS system forwarding"
-  tprint ""
-  pause
 
   cfg_begin || return 0
   cfg_set service dns forwarding system
@@ -1870,7 +2269,7 @@ dns_forwarding_menu() {
     tprint "3) Delete allow-from (existing)"
     tprint "4) Add listen-address (SAFE)"
     tprint "5) Delete listen-address (existing)"
-    tprint "6) DNS system forwarding (enable/disable)  <-- its own option"
+    tprint "6) DNS system forwarding (enable/disable)"
     tprint "7) Back"
     local c
     tread c "Select menu option #: "
@@ -1921,7 +2320,7 @@ rip_list_config() {
 }
 
 rip_add_interface_safe() {
-  local current=() ifs=() pick iface
+  local current=() ifs=() iface yn
   load_array current scan_rip_interfaces
   load_array ifs scan_eth_ifaces
 
@@ -1940,6 +2339,11 @@ rip_add_interface_safe() {
     iface="$(ask "Interface name (example: eth0)" "")"
   fi
   [ -z "$iface" ] && return 0
+  if ! is_safe_iface_name "$iface"; then
+    tprint "ERROR: Invalid interface name."
+    pause
+    return 0
+  fi
 
   if is_number_in_list "$iface" "${current[@]}"; then
     tprint ""
@@ -1952,7 +2356,8 @@ rip_add_interface_safe() {
   tprint "SUMMARY:"
   tprint "  add RIP interface: $iface"
   tprint ""
-  pause
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set protocols rip interface "$iface"
@@ -1960,7 +2365,7 @@ rip_add_interface_safe() {
 }
 
 rip_delete_interface_existing() {
-  local current=() target
+  local current=() target yn
   load_array current scan_rip_interfaces
 
   tprint ""
@@ -1975,11 +2380,8 @@ rip_delete_interface_existing() {
     return 0
   fi
 
-  tprint ""
-  tprint "SUMMARY:"
-  tprint "  delete RIP interface: $target"
-  tprint ""
-  pause
+  yn="$(choose_yes_no "Delete RIP interface: $target ?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete protocols rip interface "$target"
@@ -1987,7 +2389,7 @@ rip_delete_interface_existing() {
 }
 
 rip_add_network_safe() {
-  local current=() net
+  local current=() net yn
   load_array current scan_rip_networks
 
   tprint ""
@@ -1997,6 +2399,11 @@ rip_add_network_safe() {
 
   net="$(ask "Network to advertise (CIDR) (example: 10.0.66.0/28)" "")"
   [ -z "$net" ] && return 0
+  if ! is_valid_cidr4 "$net"; then
+    tprint "ERROR: RIP network must be IPv4/CIDR."
+    pause
+    return 0
+  fi
 
   if is_number_in_list "$net" "${current[@]}"; then
     tprint ""
@@ -2005,11 +2412,8 @@ rip_add_network_safe() {
     return 0
   fi
 
-  tprint ""
-  tprint "SUMMARY:"
-  tprint "  add RIP network: $net"
-  tprint ""
-  pause
+  yn="$(choose_yes_no "Add RIP network: $net ?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_set protocols rip network "$net"
@@ -2017,7 +2421,7 @@ rip_add_network_safe() {
 }
 
 rip_delete_network_existing() {
-  local current=() target
+  local current=() target yn
   load_array current scan_rip_networks
 
   tprint ""
@@ -2032,11 +2436,8 @@ rip_delete_network_existing() {
     return 0
   fi
 
-  tprint ""
-  tprint "SUMMARY:"
-  tprint "  delete RIP network: $target"
-  tprint ""
-  pause
+  yn="$(choose_yes_no "Delete RIP network: $target ?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
   cfg_delete protocols rip network "$target"
@@ -2076,37 +2477,60 @@ rip_menu() {
 # -----------------------------
 # Raw mode (edit ANY aspect)
 # -----------------------------
+# FIX: raw mode was open-ended. Now it rejects dangerous characters
+# and rejects quotes (since we won't eval or preserve quoting).
 raw_mode() {
   tprint ""
   tprint "RAW MODE WARNING:"
-  tprint "  Raw mode CAN overwrite or delete anything."
-  tprint "  Only use if you know exactly what you are doing."
+  tprint "  Raw mode can change anything."
+  tprint "  This mode is RESTRICTED to prevent unsafe input."
   tprint ""
-  tprint "Type ONE config command starting with: set ...  OR  delete ..."
-  tprint "Examples:"
-  tprint "  delete interfaces ethernet eth1 address 172.16.50.2/29"
-  tprint "  set firewall zone LAN from DMZ firewall name 'DMZ-to-LAN'"
+  tprint "Rules:"
+  tprint "  - Must start with: set ...  OR  delete ..."
+  # FIX: this line previously contained a literal backtick inside double quotes,
+  # which breaks parsing and causes: unexpected EOF while looking for matching ``
+  tprint '  - NO quotes, NO ; | & $ ` ( ) < > \\'
+  tprint ""
+  tprint "Example:"
+  tprint "  set service ssh port 22"
   tprint "Blank = cancel"
   tprint ""
+
   local cmd yn
   tread cmd "> "
   [ -z "$cmd" ] && return 0
 
-  yn="$(choose_yes_no "Are you sure you want to run that command?" "n" || echo "n")"
-  case "$yn" in
-    y|Y) ;;
-    *) tprint "Canceled."; pause; return 0 ;;
+  if reject_if_unsafe_commandline "$cmd"; then
+    tprint ""
+    tprint "ERROR: Unsafe characters detected."
+    tprint "Remove quotes or shell symbols and try again."
+    pause
+    return 0
+  fi
+
+  # Split first token (set/delete) safely
+  # shellcheck disable=SC2086
+  set -- $cmd
+  local verb="${1:-}"
+  shift || true
+
+  case "$verb" in
+    set|delete) ;;
+    *)
+      tprint "ERROR: Raw mode only allows commands starting with 'set' or 'delete'."
+      pause
+      return 0
+      ;;
   esac
+
+  yn="$(choose_yes_no "Are you sure you want to run that command?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
-
-  # Use API wrappers for raw commands too (only set/delete supported here)
-  case "$cmd" in
-    set\ *)    eval "cfg_$cmd" ;;
-    delete\ *) eval "cfg_$cmd" ;;
-    *) tprint "ERROR: Raw mode only allows commands starting with 'set' or 'delete'."; cfg_end; pause; return 0 ;;
+  case "$verb" in
+    set)    cfg_set "$@" ;;
+    delete) cfg_delete "$@" ;;
   esac
-
   cfg_apply
 }
 
@@ -2128,7 +2552,7 @@ main_menu() {
     tprint "4) System submenu (users + hostname)"
     tprint "5) DNS Forwarding submenu"
     tprint "6) RIP submenu"
-    tprint "7) Raw mode (set/delete anything)"
+    tprint "7) Raw mode (restricted set/delete)"
     tprint "8) Show full config (commands)"
     tprint "9) Exit"
     tprint ""
