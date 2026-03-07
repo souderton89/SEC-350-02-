@@ -804,6 +804,8 @@ zone_create_single_interface() {
   if [ "$zone_type" = "local" ]; then
     cfg_set firewall zone "$zname" local-zone
   else
+    # VyOS syntax: set firewall zone <name> interface <iface>
+    # Note: interface assignment happens AFTER zone creation
     cfg_set firewall zone "$zname" interface "$iface"
   fi
   cfg_apply
