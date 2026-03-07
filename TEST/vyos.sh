@@ -579,6 +579,7 @@ get_current_hostname() {
 scan_dns_allow_from()    { grep_cfg "set service dns forwarding allow-from "    | awk '{print $6}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 scan_dns_listen_address() { grep_cfg "set service dns forwarding listen-address " | awk '{print $6}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 dns_system_is_enabled()  { grep_cfg "set service dns forwarding system" | grep -q .; }
+scan_dns_name_servers()  { grep_cfg "set system name-server " | awk '{print $4}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 
 # --- RIP ---
 scan_rip_interfaces()       { grep_cfg "set protocols rip interface "           | awk '{print $5}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
@@ -722,6 +723,7 @@ _dns_summary() {
   tprint "  listen-address: $(scan_dns_listen_address | join_lines || echo NONE)"
   local sys="disabled"; dns_system_is_enabled && sys="ENABLED"
   tprint "  system:         $sys"
+  tprint "  name-servers:   $(scan_dns_name_servers   | join_lines || echo NONE)"
 }
 _rip_summary() {
   tprint "  interfaces:         $(scan_rip_interfaces        | join_lines || echo NONE)"
@@ -1233,9 +1235,9 @@ fw_add_rule_guided_safe() {
   [ -n "$sport" ] && cfg_set firewall ipv4 name "$rs" rule "$n" source port "$sport"
   [ -n "$dport" ] && cfg_set firewall ipv4 name "$rs" rule "$n" destination port "$dport"
   # VyOS 2025 rolling: state match requires "enable" keyword
-  { [ "$state_est" = "y" ] || [ "$state_est" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state established enable
-  { [ "$state_rel" = "y" ] || [ "$state_rel" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state related enable
-  { [ "$state_new" = "y" ] || [ "$state_new" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state new enable
+  { [ "$state_est" = "y" ] || [ "$state_est" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state established
+  { [ "$state_rel" = "y" ] || [ "$state_rel" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state related
+  { [ "$state_new" = "y" ] || [ "$state_new" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state new
   cfg_apply
 }
 
@@ -1287,8 +1289,8 @@ fw_update_single_field() {
       yn="$(choose_yes_no "Enable this state match?" "y" || echo "n")"
       local st="${field#state }"
       cfg_begin || return 0
-      # VyOS 2025 rolling: state match requires "enable" keyword
-      [ "$yn" = "y" ] && cfg_set   firewall ipv4 name "$rs" rule "$n" state "$st" enable \
+      # VyOS rolling current: state match is just the state name, no "enable" keyword
+      [ "$yn" = "y" ] && cfg_set   firewall ipv4 name "$rs" rule "$n" state "$st" \
                       || cfg_delete firewall ipv4 name "$rs" rule "$n" state "$st"
       cfg_apply ;;
     *) tprint "Invalid."; pause ;;
@@ -2144,10 +2146,105 @@ dns_system_forwarding_toggle() {
   fi
 }
 
+dns_list_name_servers() {
+  tprint ""
+  tprint "You selected: List system name-servers"
+  tprint "Command: set system name-server <A.B.C.D>"
+  tprint ""
+  tprint "Current name-servers:"
+  tprint "--------------------------------------------------------"
+  local ns=()
+  load_array ns scan_dns_name_servers
+  if [ "${#ns[@]}" -eq 0 ]; then
+    tprint "  (none configured)"
+  else
+    local n; for n in "${ns[@]}"; do tprint "  $n"; done
+  fi
+  tprint "--------------------------------------------------------"
+  tprint ""
+  tprint "Raw config lines:"
+  tprint "--------------------------------------------------------"
+  (grep_cfg "set system name-server " || true) >"$TTY"
+  tprint "--------------------------------------------------------"
+  pause
+}
+
+dns_add_name_server_safe() {
+  local current=() ip yn
+
+  load_array current scan_dns_name_servers
+
+  tprint ""
+  tprint "You selected: ADD system name-server (SAFE - will not duplicate)"
+  tprint "Command: set system name-server <A.B.C.D>"
+  tprint "This tells VyOS which upstream DNS server to query."
+  tprint ""
+  tprint "Current name-servers: ${current[*]:-(none)}"
+  tprint ""
+
+  ip="$(ask "Name-server IP (example: 10.0.17.2)" "")"
+  [ -z "$ip" ] && return 0
+
+  if ! is_valid_ipv4 "$ip"; then
+    tprint "ERROR: Must be a valid IPv4 address."
+    pause
+    return 0
+  fi
+
+  if is_in_list "$ip" "${current[@]}"; then
+    tprint ""
+    tprint "ERROR: Name-server already configured: $ip"
+    pause
+    return 0
+  fi
+
+  tprint ""
+  tprint "SUMMARY:"
+  tprint "  set system name-server $ip"
+  tprint ""
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  cfg_set system name-server "$ip"
+  cfg_apply
+}
+
+dns_delete_name_server_existing() {
+  local current=() target yn
+
+  load_array current scan_dns_name_servers
+
+  tprint ""
+  tprint "You selected: DELETE system name-server (existing)"
+  tprint "Command: delete system name-server <A.B.C.D>"
+  tprint ""
+
+  require_nonempty_list_or_return "System name-servers" "${current[@]}" || return 0
+
+  if select_from_list "Select name-server to DELETE" "${current[@]}"; then
+    target="$SELECTED"
+  else
+    return 0
+  fi
+
+  tprint ""
+  tprint "You are about to delete: system name-server $target"
+  tprint ""
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  cfg_delete system name-server "$target"
+  cfg_apply
+}
+
 dns_forwarding_menu() {
   warn_if_no_access || return 0
   while true; do
-    tprint ""; tprint "====== DNS Forwarding ======"
+    tprint ""; tprint "=============================="
+    tprint " DNS Forwarding Submenu"
+    tprint "=============================="
     _dns_summary; tprint ""
     tprint "1) List full DNS forwarding config"
     tprint "2) Add allow-from (safe)"
@@ -2155,8 +2252,12 @@ dns_forwarding_menu() {
     tprint "4) Add listen-address (safe)"
     tprint "5) Delete listen-address"
     tprint "6) Toggle system forwarding"
-    tprint "7) Back"
-    local c; tread c "Select: " || continue
+    tprint "--- System Name-Servers ---"
+    tprint "7) List name-servers"
+    tprint "8) Add name-server (safe)"
+    tprint "9) Delete name-server"
+    tprint "10) Back"
+    local c; tread c "Select menu option #: " || continue
     case "$c" in
       1) tprint ""; grep_cfg "set service dns forwarding " >"$TTY" 2>/dev/null || true; pause ;;
       2) dns_add_allow_from_safe ;;
@@ -2164,7 +2265,10 @@ dns_forwarding_menu() {
       4) dns_add_listen_address_safe ;;
       5) dns_delete_listen_address_existing ;;
       6) dns_system_forwarding_toggle ;;
-      7) return 0 ;;
+      7) dns_list_name_servers ;;
+      8) dns_add_name_server_safe ;;
+      9) dns_delete_name_server_existing ;;
+      10) return 0 ;;
       *) tprint "Invalid." ;;
     esac
   done
@@ -2982,7 +3086,8 @@ main_menu() {
     tprint "FW zones:     $(scan_fw_zones          | join_lines || echo NONE)"
     tprint "Static routes:$(scan_static_routes     | join_lines || echo NONE)"
     tprint "DHCP pools:   $(scan_dhcp_pools        | join_lines || echo NONE)"
-    tprint "NAT dest/src: $(scan_nat_dest_rules | join_lines || echo -) / $(scan_nat_source_rules | join_lines || echo -)"
+    tprint "NAT dest:     $(scan_nat_dest_rules   | join_lines || echo NONE)"
+    tprint "NAT src:      $(scan_nat_source_rules | join_lines || echo NONE)"
     tprint ""
     tprint " 1) Interfaces       (eth / bond / VLAN / loopback)"
     tprint " 2) Firewall         (rules + zone management)"
