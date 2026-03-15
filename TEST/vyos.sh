@@ -580,6 +580,7 @@ scan_dns_allow_from()    { grep_cfg "set service dns forwarding allow-from "    
 scan_dns_listen_address() { grep_cfg "set service dns forwarding listen-address " | awk '{print $6}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 dns_system_is_enabled()  { grep_cfg "set service dns forwarding system" | grep -q .; }
 scan_dns_name_servers()  { grep_cfg "set system name-server " | awk '{print $4}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
+scan_dns_forward_domains() { grep_cfg "set service dns forwarding domain " | grep -F " name-server " | awk '{print $6}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 
 # --- RIP ---
 scan_rip_interfaces()       { grep_cfg "set protocols rip interface "           | awk '{print $5}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
@@ -724,6 +725,7 @@ _dns_summary() {
   local sys="disabled"; dns_system_is_enabled && sys="ENABLED"
   tprint "  system:         $sys"
   tprint "  name-servers:   $(scan_dns_name_servers   | join_lines || echo NONE)"
+  tprint "  fwd domains:    $(scan_dns_forward_domains | join_lines || echo NONE)"
 }
 _rip_summary() {
   tprint "  interfaces:         $(scan_rip_interfaces        | join_lines || echo NONE)"
@@ -2239,6 +2241,92 @@ dns_delete_name_server_existing() {
   cfg_apply
 }
 
+dns_add_domain_forwarding_safe() {
+  local current=() domain server yn
+
+  load_array current scan_dns_forward_domains
+
+  tprint ""
+  tprint "You selected: ADD domain forwarding (SAFE - will not overwrite)"
+  tprint "Command: set service dns forwarding domain <domain> name-server <IP>"
+  tprint "Example: set service dns forwarding domain yourdomain.local name-server 192.168.6.1"
+  tprint ""
+  tprint "Current forwarding domains: ${current[*]:-(none)}"
+  tprint ""
+
+  domain="$(ask "Domain to forward (e.g. yourdomain.local)" "")"
+  [ -z "$domain" ] && return 0
+
+  if ! is_valid_hostname "$domain"; then
+    tprint "ERROR: Invalid domain name."
+    pause
+    return 0
+  fi
+
+  if is_in_list "$domain" "${current[@]}"; then
+    tprint ""
+    tprint "ERROR: Domain '$domain' already has a forwarding entry."
+    tprint "Use Delete + Add to replace it."
+    pause
+    return 0
+  fi
+
+  server="$(ask "Server IP to forward $domain queries to" "")"
+  [ -z "$server" ] && return 0
+
+  if ! is_valid_ipv4 "$server"; then
+    tprint "ERROR: Must be a valid IPv4 address."
+    pause
+    return 0
+  fi
+
+  tprint ""
+  tprint "SUMMARY:"
+  tprint "  set service dns forwarding domain $domain name-server $server"
+  tprint ""
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  cfg_set service dns forwarding domain "$domain" name-server "$server"
+  cfg_apply
+}
+
+dns_delete_domain_forwarding_existing() {
+  local current=() target yn
+
+  load_array current scan_dns_forward_domains
+
+  tprint ""
+  tprint "You selected: DELETE domain forwarding (existing)"
+  tprint "Command: delete service dns forwarding domain <domain>"
+  tprint ""
+
+  require_nonempty_list_or_return "DNS forwarding domains" "${current[@]}" || return 0
+
+  select_from_list "Select domain forwarding entry to DELETE" "${current[@]}" || return 0
+  target="$SELECTED"
+
+  tprint ""
+  tprint "You are about to delete: dns forwarding domain $target"
+  tprint ""
+  tprint "Current config for this domain:"
+  tprint "--------------------------------------------------------"
+  {
+    grep_cfg "set service dns forwarding domain $target "
+    grep_cfg "set service dns forwarding domain '$target' "
+  } >"$TTY" 2>/dev/null || true
+  tprint "--------------------------------------------------------"
+  tprint ""
+
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  cfg_delete service dns forwarding domain "$target"
+  cfg_apply
+}
+
 dns_forwarding_menu() {
   warn_if_no_access || return 0
   while true; do
@@ -2256,19 +2344,24 @@ dns_forwarding_menu() {
     tprint "7) List name-servers"
     tprint "8) Add name-server (safe)"
     tprint "9) Delete name-server"
-    tprint "10) Back"
+    tprint "--- Domain Forwarding ---"
+    tprint "10) Add domain forwarding  (set service dns forwarding domain <domain> name-server <IP>)"
+    tprint "11) Delete domain forwarding"
+    tprint "12) Back"
     local c; tread c "Select menu option #: " || continue
     case "$c" in
-      1) tprint ""; grep_cfg "set service dns forwarding " >"$TTY" 2>/dev/null || true; pause ;;
-      2) dns_add_allow_from_safe ;;
-      3) dns_delete_allow_from_existing ;;
-      4) dns_add_listen_address_safe ;;
-      5) dns_delete_listen_address_existing ;;
-      6) dns_system_forwarding_toggle ;;
-      7) dns_list_name_servers ;;
-      8) dns_add_name_server_safe ;;
-      9) dns_delete_name_server_existing ;;
-      10) return 0 ;;
+      1)  tprint ""; grep_cfg "set service dns forwarding " >"$TTY" 2>/dev/null || true; pause ;;
+      2)  dns_add_allow_from_safe ;;
+      3)  dns_delete_allow_from_existing ;;
+      4)  dns_add_listen_address_safe ;;
+      5)  dns_delete_listen_address_existing ;;
+      6)  dns_system_forwarding_toggle ;;
+      7)  dns_list_name_servers ;;
+      8)  dns_add_name_server_safe ;;
+      9)  dns_delete_name_server_existing ;;
+      10) dns_add_domain_forwarding_safe ;;
+      11) dns_delete_domain_forwarding_existing ;;
+      12) return 0 ;;
       *) tprint "Invalid." ;;
     esac
   done
