@@ -259,7 +259,7 @@ is_deletable_user() {
   [[ "$user" != root    ]] || return 1
   [[ "$user" != nobody  ]] || return 1
   [[ "$uid"  =~ ^[0-9]+$ ]] || return 1
-  (( uid >= 1000 ))          || return 1
+  [[ "$uid" -ge 1000 ]]      || return 1
   [[ "$home" == /home/* || "$home" == /root ]] && [[ "$user" != root ]] || \
     [[ "$home" == /home/* ]] || return 1
   return 0
@@ -314,9 +314,9 @@ delete_users_menu() {
 
   local choice
   read -r -p $'\nEnter number: ' choice
-  [[ "$choice" =~ ^[0-9]+$ ]]                          || { err "Invalid input."; return 1; }
-  [[ "$choice" -eq 0 ]]                                && { info "Canceled."; return 0; }
-  (( choice >= 1 && choice <= ${#users[@]} ))          || { err "Out of range."; return 1; }
+  [[ "$choice" =~ ^[0-9]+$ ]]                                          || { err "Invalid input."; return 1; }
+  [[ "$choice" -eq 0 ]]                                                && { info "Canceled."; return 0; }
+  [[ "$choice" -ge 1 && "$choice" -le "${#users[@]}" ]]               || { err "Out of range."; return 1; }
 
   local target="${users[$((choice-1))]}"
   [[ -z "${current:-}" || "$target" != "$current" ]]  || { err "Cannot delete the current session user: $current"; return 1; }
@@ -841,7 +841,7 @@ manage_netplan_files() {
   read -r -p "Select file to manage [0-${#files[@]}]: " choice
   [[ "$choice" =~ ^[0-9]+$ ]] || { err "Invalid input."; return 1; }
   [[ "$choice" -eq 0 ]]       && return 0
-  (( choice >= 1 && choice <= ${#files[@]} )) || { err "Out of range."; return 1; }
+  [[ "$choice" -ge 1 && "$choice" -le "${#files[@]}" ]] || { err "Out of range."; return 1; }
 
   local selected="${files[$((choice-1))]}"
   echo
@@ -1202,6 +1202,9 @@ EOF
 }
 
 collect_network_inputs() {
+  # Initialize output globals — prevents stale values if user cancels mid-run
+  _NET_IFACE="" _NET_IPCIDR="" _NET_GW="" _NET_DNS="" _NET_SEARCH=""
+
   local iface
   prompt_select_iface iface "interface to configure" || return 1
   info "Using interface: $iface"
@@ -1468,14 +1471,18 @@ remove_package() {
   read -r -p "  Remove '$pkg'? [y/N]: " yn
   [[ "${yn,,}" == y ]] || { info "Canceled."; return 0; }
 
-  case "$OS_FAMILY" in
+  if case "$OS_FAMILY" in
     debian|vyos) apt-get remove -y "$pkg" ;;
     rhel)  if command -v dnf &>/dev/null; then dnf remove -y "$pkg"; else yum remove -y "$pkg"; fi ;;
     alpine)   apk del "$pkg" ;;
     opensuse) zypper --non-interactive remove "$pkg" ;;
     arch)     pacman -R --noconfirm "$pkg" ;;
     *) err "Unsupported OS for package removal."; return 1 ;;
-  esac && ok "'$pkg' removed." || err "Removal failed."
+  esac; then
+    ok "'$pkg' removed."
+  else
+    err "Removal of '$pkg' failed."
+  fi
 }
 
 search_package() {
@@ -1732,8 +1739,8 @@ prompt_select_iface() {
 
   local _choice
   read -r -p "  Select ${_label} [1-${#_ifaces[@]}]: " _choice
-  [[ "$_choice" =~ ^[0-9]+$ ]]                           || { err "Invalid input."; return 1; }
-  (( _choice >= 1 && _choice <= ${#_ifaces[@]} ))        || { err "Out of range."; return 1; }
+  [[ "$_choice" =~ ^[0-9]+$ ]]                                          || { err "Invalid input."; return 1; }
+  [[ "$_choice" -ge 1 && "$_choice" -le "${#_ifaces[@]}" ]]            || { err "Out of range."; return 1; }
 
   printf -v "$_psv" '%s' "${_ifaces[$((_choice-1))]}"
 }
@@ -2051,12 +2058,24 @@ enable_dhcp_service() {
   fi
 
   if command -v rc-service &>/dev/null; then
-    rc-service dhcpd start  2>/dev/null || rc-service "$svc" start
-    rc-update add dhcpd     2>/dev/null || rc-update add "$svc"
-    ok "DHCP service started + enabled (OpenRC)."
+    if rc-service dhcpd start 2>/dev/null || rc-service "$svc" start 2>/dev/null; then
+      rc-update add dhcpd 2>/dev/null || rc-update add "$svc" 2>/dev/null || true
+      ok "DHCP service started + enabled (OpenRC)."
+    else
+      err "DHCP service failed to start. Check: rc-service $svc status"
+      return 1
+    fi
   else
-    systemctl enable --now "$svc"
-    ok "DHCP service started + enabled: $svc"
+    systemctl enable "$svc" 2>/dev/null || true
+    if systemctl start "$svc" 2>/dev/null; then
+      ok "DHCP service started + enabled: $svc"
+    else
+      err "DHCP service failed to start."
+      info "Last journal entries:"
+      journalctl -u "$svc" -n 20 --no-pager 2>/dev/null || true
+      err "Fix the config and run: systemctl start $svc"
+      return 1
+    fi
   fi
 }
 
@@ -2108,20 +2127,34 @@ show_dhcp_status() {
   echo
 
   if command -v systemctl &>/dev/null; then
-    systemctl status "${svc:-dhcpd}" --no-pager -l 2>/dev/null | head -20 || \
+    systemctl status "${svc:-dhcpd}" --no-pager -l 2>/dev/null | head -25 || \
       warn "Service ${svc} not found or not started."
+    echo
+    info "Recent journal entries (last 30 lines):"
+    echo
+    journalctl -u "${svc:-dhcpd}" -n 30 --no-pager 2>/dev/null || true
   elif command -v rc-service &>/dev/null; then
     rc-service dhcpd status 2>/dev/null || warn "dhcpd not running."
   fi
 
   echo
   if [[ -n "${conf:-}" && -f "${conf}" ]]; then
+    info "Config syntax check:"
+    if command -v dhcpd &>/dev/null; then
+      if dhcpd -t -cf "$conf" 2>/tmp/dhcpd-check.out; then
+        ok "Config syntax OK."
+      else
+        err "Config has syntax errors:"
+        cat /tmp/dhcpd-check.out >&2 || true
+      fi
+      rm -f /tmp/dhcpd-check.out
+    fi
+    echo
     info "Config file contents:"
     echo
     cat "$conf"
   fi
 
-  # ── Also show the interfaces file so user can verify ──────────────────
   echo
   if [[ -f "${DHCP_IFACE_FILE_debian}" ]]; then
     info "Interfaces file (${DHCP_IFACE_FILE_debian}):"
@@ -2212,6 +2245,25 @@ setup_dhcp_server() {
   echo "$conf_preview" > "$conf_file"
   ok "Config written → $conf_file"
 
+  # ── Validate config syntax before attempting to start the service ─────
+  info "Validating config syntax (dhcpd -t) ..."
+  if command -v dhcpd &>/dev/null; then
+    if dhcpd -t -cf "$conf_file" 2>/tmp/dhcpd-test.out; then
+      ok "Config syntax OK."
+    else
+      err "dhcpd config syntax check FAILED. The service will not start."
+      err "Error details:"
+      cat /tmp/dhcpd-test.out >&2 || true
+      err "Config file: $conf_file"
+      err "Fix the config and re-run the DHCP wizard, or edit manually."
+      rm -f /tmp/dhcpd-test.out
+      return 1
+    fi
+    rm -f /tmp/dhcpd-test.out
+  else
+    warn "dhcpd binary not found — skipping syntax check."
+  fi
+
   # ── always set interface binding on debian/vyos ───────────────────────
   if [[ "$OS_FAMILY" == "debian" || "$OS_FAMILY" == "vyos" ]]; then
     local iface_list=""
@@ -2233,7 +2285,7 @@ setup_dhcp_server() {
   ok "DHCP server is up and running!"
   echo
   info "Config file : $conf_file"
-  info "Interfaces  : $(grep INTERFACESv4 ${DHCP_IFACE_FILE_debian} 2>/dev/null || echo 'see /etc/default/isc-dhcp-server')"
+  info "Interfaces  : $(grep INTERFACESv4 "$DHCP_IFACE_FILE_debian" 2>/dev/null || echo 'see /etc/default/isc-dhcp-server')"
 }
 
 _setup_dhcp_vyos() {
@@ -2288,11 +2340,19 @@ dhcp_menu() {
       2) show_dhcp_leases  ;;
       3) show_dhcp_status  ;;
       4)
+        local svc; svc="$(dhcp_get SVC)"
         info "Restarting DHCP service: ${svc:-dhcpd} ..."
+        local restart_ok=false
         if command -v rc-service &>/dev/null; then
-          rc-service "${svc:-dhcpd}" restart && ok "Restarted." || err "Restart failed."
+          rc-service "${svc:-dhcpd}" restart 2>/dev/null && restart_ok=true || true
         else
-          systemctl restart "${svc:-dhcpd}" && ok "Restarted." || err "Restart failed."
+          systemctl restart "${svc:-dhcpd}" 2>/dev/null && restart_ok=true || true
+        fi
+        if $restart_ok; then
+          ok "Restarted."
+        else
+          err "Restart failed. Recent journal:"
+          journalctl -u "${svc:-dhcpd}" -n 20 --no-pager 2>/dev/null || true
         fi
         ;;
       5) remove_dhcp_server ;;
