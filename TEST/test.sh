@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Colour helpers — defined FIRST so the ERR trap can use them ──
 RED='\033[0;31m'
 GRN='\033[0;32m'
 YEL='\033[1;33m'
@@ -11,31 +10,11 @@ RESET='\033[0m'
 
 trap 'echo -e "${RED}ERROR: line $LINENO: $BASH_COMMAND${RESET}" >&2' ERR
 
-# =============================================================
-# System Setup Script — Multi-OS Edition
-# Supports: Debian/Ubuntu, RHEL/Rocky/Alma/CentOS/Fedora,
-#           VyOS, Alpine, openSUSE, Arch Linux
-#
-# Features:
-#   - User creation (RSA key-only / password users)
-#   - User deletion (numbered list; blocks deleting active user)
-#   - Sudoers / NOPASSWD management
-#   - Hostname configuration
-#   - Disable root SSH login (auto-detects service name)
-#   - Network config (Netplan / NetworkManager / VyOS set commands)
-#   - SSH key generation
-#   - Git bootstrap: clone/pull repo, create hostname folder, commit+push
-#   - Authorized keys from repo
-#   - DHCP server setup (multi-subnet, static reservations, leases)
-# =============================================================
-
-# FIX #9: Enforce Bash 4.3+ (required for nameref / local -n)
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
   echo "ERROR: Bash 4.3 or newer is required (found ${BASH_VERSION})." >&2
   exit 1
 fi
 
-# ── Repo + key defaults (overridable via menu / config file) ──
 REPO_URL="https://github.com/souderton89/SEC-350-02-.git"
 REPO_DIR_NAME="SEC-350-02-"
 DEFAULT_KEY_REL_PATH="RW01-jumper/debian/hamed_bar.pub"
@@ -48,7 +27,6 @@ warn()    { echo -e "${YEL}[WARN]${RESET}  $*" >&2; }
 err()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 header()  { echo -e "\n${BLD}${CYN}══════════════════════════════${RESET}\n${BLD} $*${RESET}\n${BLD}${CYN}══════════════════════════════${RESET}"; }
 
-# ── Root check ────────────────────────────────────────────────
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     err "Run as root (use sudo)."
@@ -56,25 +34,16 @@ require_root() {
   fi
 }
 
-# ─────────────────────────────────────────────────────────────
-# OS DETECTION
-# Populates: OS_ID  OS_FAMILY  OS_VERSION_ID
-# Families:  debian | rhel | vyos | alpine | opensuse | arch | unknown
-# ─────────────────────────────────────────────────────────────
 detect_os() {
   if [[ ! -f /etc/os-release ]]; then
     err "/etc/os-release not found; cannot detect OS."
     exit 1
   fi
-
-  # source may return non-zero on some Rocky/RHEL builds — suppress with || true
-  # shellcheck disable=SC1091
   source /etc/os-release || true
   OS_ID="${ID:-unknown}"
   OS_LIKE="${ID_LIKE:-}"
   OS_VERSION_ID="${VERSION_ID:-}"
 
-  # If source failed to populate ID, parse manually as fallback
   if [[ "$OS_ID" == "unknown" && -f /etc/os-release ]]; then
     OS_ID="$(   grep -E '^ID='        /etc/os-release | cut -d= -f2 | tr -d '"' )"
     OS_LIKE="$( grep -E '^ID_LIKE='   /etc/os-release | cut -d= -f2 | tr -d '"' )"
@@ -99,16 +68,12 @@ detect_os() {
       ;;
   esac
 
-  # VyOS ID may show as debian in some builds — check for vbash / vyos marker
   if [[ "$OS_FAMILY" == "debian" ]] && command -v vbash &>/dev/null 2>&1; then
     OS_FAMILY="vyos"
     OS_ID="vyos"
   fi
 }
 
-# ─────────────────────────────────────────────────────────────
-# PACKAGE MANAGER HELPERS
-# ─────────────────────────────────────────────────────────────
 pkg_install() {
   local pkgs=("$@")
   case "$OS_FAMILY" in
@@ -122,13 +87,8 @@ pkg_install() {
   esac
 }
 
-# ─────────────────────────────────────────────────────────────
-# CONFIG LOAD / SAVE
-# ─────────────────────────────────────────────────────────────
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    # source may return non-zero on some systems — suppress with || true
     source "$CONFIG_FILE" || {
       warn "Could not source $CONFIG_FILE — ignoring saved config."
     }
@@ -163,23 +123,18 @@ configure_repo_settings() {
   save_config
 }
 
-# ─────────────────────────────────────────────────────────────
-# USER / GROUP HELPERS
-# ─────────────────────────────────────────────────────────────
 user_exists() { id "$1" &>/dev/null; }
 
 valid_username() {
-  # POSIX: start with letter or _, then letters/digits/_/- ; max 32 chars total
   [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
 }
 
 prompt_username() {
   local u
   read -r -p "Enter username: " u
-  u="${u// /}"   # strip spaces
+  u="${u// /}"
   [[ -n "$u" ]]     || { err "Username cannot be blank."; return 1; }
   [[ "$u" != root ]] || { err "Refusing to operate on 'root'."; return 1; }
-  # FIX #13: clearer error message about max length
   valid_username "$u" || { err "Invalid username '$u'. Must start with [a-z_], followed by [a-z0-9_-], max 32 chars total."; return 1; }
   echo "$u"
 }
@@ -194,7 +149,6 @@ add_to_group_if_needed() {
   fi
 }
 
-# FIX #3: warn when no suitable tool is available to remove group membership
 remove_from_group_if_present() {
   local u="$1" grp="$2"
   if id -nG "$u" | tr ' ' '\n' | grep -qx "$grp"; then
@@ -219,9 +173,6 @@ get_sudo_group() {
   esac
 }
 
-# ─────────────────────────────────────────────────────────────
-# SUDOERS
-# ─────────────────────────────────────────────────────────────
 sudoers_file() { echo "/etc/sudoers.d/${SUDOERS_DROPIN_NAME}"; }
 
 ensure_sudo_installed() {
@@ -270,22 +221,16 @@ remove_passwordless_sudo_if_present() {
   fi
 }
 
-# ─────────────────────────────────────────────────────────────
-# USER DELETION
-# ─────────────────────────────────────────────────────────────
 get_current_login_user() {
   local u="${SUDO_USER:-}"
   [[ -z "$u" ]] && u="$(logname 2>/dev/null || true)"
   echo "$u"
 }
 
-# Portable getent passwd wrapper — falls back to /etc/passwd on systems
-# where getent is unavailable (some minimal Alpine builds)
 _getent_passwd() {
   if command -v getent &>/dev/null; then
     getent passwd "$@"
   else
-    # Parse /etc/passwd directly
     if [[ $# -eq 0 ]]; then
       cat /etc/passwd
     else
@@ -330,7 +275,6 @@ delete_user_by_name() {
   if [[ "$OS_FAMILY" == "debian" || "$OS_FAMILY" == "vyos" ]] && command -v deluser &>/dev/null; then
     deluser --remove-home "$target"
   elif [[ "$OS_FAMILY" == "alpine" ]]; then
-    # FIX #4: verify home dir belongs to this user before removing
     local user_home
     user_home="$(_getent_passwd "$target" | cut -d: -f6)"
     deluser "$target"
@@ -377,9 +321,6 @@ delete_users_menu() {
   delete_user_by_name "$target"
 }
 
-# ─────────────────────────────────────────────────────────────
-# USER CREATION
-# ─────────────────────────────────────────────────────────────
 create_user_key_only() {
   local u="$1"
   if user_exists "$u"; then
@@ -391,8 +332,6 @@ create_user_key_only() {
     esac
     ok "Created user '$u'."
   fi
-  # Lock the password. Alpine's busybox passwd may not support -l;
-  # fall back to usermod -L which is universally available.
   if passwd -l "$u" &>/dev/null 2>&1; then
     true
   elif command -v usermod &>/dev/null; then
@@ -474,9 +413,6 @@ _offer_git_bootstrap() {
   [[ "${yn,,}" == y ]] && bootstrap_git_repo_and_ssh_key "$u"
 }
 
-# ─────────────────────────────────────────────────────────────
-# SSH KEY GENERATION
-# ─────────────────────────────────────────────────────────────
 generate_ssh_key() {
   local u="$1"
   local home_dir="/home/$u"
@@ -540,9 +476,6 @@ generate_ssh_key_menu() {
   generate_ssh_key "$u"
 }
 
-# ─────────────────────────────────────────────────────────────
-# GIT / REPO HELPERS
-# ─────────────────────────────────────────────────────────────
 install_git() {
   command -v git &>/dev/null && { info "Git already installed."; return 0; }
   info "Installing git..."
@@ -584,7 +517,6 @@ prompt_github_creds_and_store() {
     "$host" "$gh_user" "$token" \
     | sudo -H -u "$u" git credential approve
 
-  # FIX #11: ensure .git-credentials is not world-readable
   local creds_file="/home/$u/.git-credentials"
   if [[ -f "$creds_file" ]]; then
     chmod 600 "$creds_file"
@@ -620,7 +552,6 @@ ensure_git_identity() {
   ok "Git identity set: name='$name'  email='$email'"
 }
 
-# Returns 0 if dir was CREATED, 1 if it already existed
 ensure_hostname_dir_in_repo() {
   local u="$1" repo_dir="$2"
   local short_host; short_host="$(get_short_hostname)"
@@ -636,11 +567,11 @@ ensure_hostname_dir_in_repo() {
     info "Creating host directory in repo: $host_dir"
     sudo -H -u "$u" mkdir -p "$host_dir"
     printf 'hi from %s\n' "$short_host" | sudo -H -u "$u" tee "$host_dir/README.md" >/dev/null
-    return 0   # created
+    return 0
   fi
 
   info "Host directory already exists: $host_dir"
-  return 1   # already existed
+  return 1
 }
 
 git_add_commit_and_push_prompted() {
@@ -694,12 +625,10 @@ clone_or_update_repo_for_user() {
   chown -R "$u:$u" "$repo_dir"
 
   if ensure_hostname_dir_in_repo "$u" "$repo_dir"; then
-    # Dir was newly created → credentials + commit + push
     chown -R "$u:$u" "$repo_dir"
     prompt_github_creds_and_store "$u"
     git_add_commit_and_push_prompted "$u" "$repo_dir"
   else
-    # FIX #6: inform the user when nothing was committed due to existing dir
     info "Hostname directory already present — no commit needed. Use menu option 8 to push manual changes."
   fi
 
@@ -753,9 +682,6 @@ bootstrap_git_repo_and_ssh_key() {
   setup_authorized_keys_from_repo "$u"
 }
 
-# ─────────────────────────────────────────────────────────────
-# HOSTNAME
-# ─────────────────────────────────────────────────────────────
 set_hostname() {
   local current; current="$(get_machine_hostname)"
   info "Current hostname: $current"
@@ -784,9 +710,6 @@ set_hostname() {
   done
 }
 
-# ─────────────────────────────────────────────────────────────
-# SSH — DISABLE ROOT LOGIN
-# ─────────────────────────────────────────────────────────────
 disable_root_ssh() {
   local cfg="/etc/ssh/sshd_config"
   [[ -f "$cfg" ]] || { err "$cfg not found."; return; }
@@ -820,9 +743,6 @@ disable_root_ssh() {
   warn "Could not find/restart SSH service automatically. Restart it manually."
 }
 
-# ─────────────────────────────────────────────────────────────
-# NETWORK CONFIGURATION
-# ─────────────────────────────────────────────────────────────
 default_iface() {
   ip -o link show 2>/dev/null \
     | awk -F': ' '{print $2}' \
@@ -855,7 +775,6 @@ dns_to_list() {
   local IFS="$sep"; echo "${out[*]}"
 }
 
-# FIX #8: Netplan detection no longer requires existing YAML files — binary + dir is sufficient
 detect_network_tool() {
   [[ "$OS_FAMILY" == "vyos" ]] && { echo "vyos"; return; }
 
@@ -875,10 +794,123 @@ detect_network_tool() {
   echo "unknown"
 }
 
+# ── LIST existing netplan files so user can pick one to edit ──────────────
+list_netplan_files() {
+  find /etc/netplan -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | sort
+}
+
+# ── NEW: interactive netplan file editor / selector ───────────────────────
+manage_netplan_files() {
+  header "Manage Existing Netplan Files"
+
+  local files=()
+  mapfile -t files < <(list_netplan_files)
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    info "No .yaml/.yml files found in /etc/netplan"
+    return 0
+  fi
+
+  echo "  Existing netplan files:"
+  echo
+  local i
+  for i in "${!files[@]}"; do
+    local status="active"
+    [[ "${files[$i]}" == *.disabled ]] && status="DISABLED"
+    printf "  %2d) %-55s [%s]\n" "$((i+1))" "${files[$i]}" "$status"
+  done
+  echo "   0) Back"
+  echo
+
+  local choice
+  read -r -p "Select file to manage [0-${#files[@]}]: " choice
+  [[ "$choice" =~ ^[0-9]+$ ]] || { err "Invalid input."; return 1; }
+  [[ "$choice" -eq 0 ]]       && return 0
+  (( choice >= 1 && choice <= ${#files[@]} )) || { err "Out of range."; return 1; }
+
+  local selected="${files[$((choice-1))]}"
+  echo
+  echo "  Selected: ${BLD}$selected${RESET}"
+  echo
+  echo "  a) View contents"
+  echo "  b) Edit with nano"
+  echo "  c) Disable (rename to .disabled)"
+  echo "  d) Enable  (remove .disabled suffix)"
+  echo "  e) Delete"
+  echo "  f) Back"
+  echo
+
+  local action
+  read -r -p "Action [a-f]: " action
+  case "${action,,}" in
+    a)
+      echo
+      cat "$selected"
+      ;;
+    b)
+      if command -v nano &>/dev/null; then
+        nano "$selected"
+        read -r -p "Run 'netplan apply' now? [y/N]: " yn
+        if [[ "${yn,,}" == y ]]; then
+          netplan generate && netplan apply && ok "Netplan applied." || err "netplan apply failed — check the file."
+        fi
+      else
+        err "nano not found. Install it first (Package Management → install nano)."
+      fi
+      ;;
+    c)
+      if [[ "$selected" == *.disabled ]]; then
+        info "Already disabled."
+      else
+        mv "$selected" "${selected}.disabled"
+        ok "Disabled: ${selected}.disabled"
+        read -r -p "Run 'netplan apply' now? [y/N]: " yn
+        [[ "${yn,,}" == y ]] && netplan generate && netplan apply && ok "Applied." || true
+      fi
+      ;;
+    d)
+      if [[ "$selected" == *.disabled ]]; then
+        local enabled="${selected%.disabled}"
+        mv "$selected" "$enabled"
+        ok "Enabled: $enabled"
+        read -r -p "Run 'netplan apply' now? [y/N]: " yn
+        [[ "${yn,,}" == y ]] && netplan generate && netplan apply && ok "Applied." || true
+      else
+        info "File is already active (not .disabled)."
+      fi
+      ;;
+    e)
+      read -r -p "  Delete '$selected'? This cannot be undone. [y/N]: " yn
+      if [[ "${yn,,}" == y ]]; then
+        rm -f "$selected"
+        ok "Deleted: $selected"
+        read -r -p "Run 'netplan apply' now? [y/N]: " yn2
+        [[ "${yn2,,}" == y ]] && netplan generate && netplan apply && ok "Applied." || true
+      else
+        info "Canceled."
+      fi
+      ;;
+    f) return 0 ;;
+    *) warn "Unknown action." ;;
+  esac
+}
+
 configure_netplan_static() {
   local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search="${5:-}"
   local dns_list; dns_list="$(dns_to_list "$dns_raw" ", ")"
   local out_file="/etc/netplan/99-static-${iface}.yaml"
+
+  # ── Disable any OTHER netplan files that configure this interface
+  #    to prevent "Conflicting default route declarations" errors
+  local existing
+  while IFS= read -r existing; do
+    [[ "$existing" == "$out_file" ]] && continue
+    if grep -q "$iface" "$existing" 2>/dev/null; then
+      local disabled="${existing}.disabled"
+      warn "Disabling conflicting netplan file: $(basename "$existing") → $(basename "$disabled")"
+      mv "$existing" "$disabled"
+    fi
+  done < <(find /etc/netplan -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null)
 
   info "Writing Netplan config: $out_file"
   [[ -f "$out_file" ]] && cp -a "$out_file" "${out_file}.bak.$(date +%F-%H%M%S)"
@@ -902,6 +934,14 @@ YAML
   } > "$out_file"
 
   chmod 600 "$out_file"
+
+  local disabled_count
+  disabled_count=$(find /etc/netplan -maxdepth 1 -name "*.disabled" 2>/dev/null | wc -l)
+  if (( disabled_count > 0 )); then
+    warn "$disabled_count conflicting netplan file(s) renamed to .disabled"
+    warn "To review/re-enable them use: Network → Manage existing netplan files"
+  fi
+
   netplan generate
   netplan apply
   ok "Netplan applied."
@@ -977,7 +1017,6 @@ configure_vyos_static() {
   fi
 }
 
-# FIX #5: only write /etc/resolv.conf on Alpine where ifupdown doesn't manage DNS
 configure_ifupdown_static() {
   local iface="$1" ipcidr="$2" gw="$3" dns_raw="$4" search="${5:-}"
   local ip="${ipcidr%/*}" prefix="${ipcidr#*/}"
@@ -1007,7 +1046,6 @@ iface ${iface} inet static
 EOF
   [[ -n "${search// }" ]] && echo "    dns-search ${search}" >> "$cfg"
 
-  # Only update resolv.conf directly on Alpine (ifupdown-based systems without resolvconf)
   if [[ "$OS_FAMILY" == "alpine" ]]; then
     {
       [[ -n "${search// }" ]] && echo "search ${search}"
@@ -1079,9 +1117,32 @@ configure_network() {
   esac
 }
 
-# ─────────────────────────────────────────────────────────────
-# STATUS / OVERVIEW
-# ─────────────────────────────────────────────────────────────
+# ── NEW: Network sub-menu (replaces direct configure_network call) ─────────
+network_menu() {
+  while true; do
+    local tool; tool="$(detect_network_tool)"
+    header "Network Configuration  |  Tool: $tool"
+    echo "  1) Configure static IP         (wizard)"
+    echo "  2) Manage existing netplan files (view / edit / disable / enable)"
+    echo "  3) Back"
+    echo
+
+    read -r -p "Choose [1-3]: " sub; echo
+    case "$sub" in
+      1) configure_network ;;
+      2)
+        if [[ "$tool" == "netplan" ]]; then
+          manage_netplan_files
+        else
+          warn "Netplan file management is only available when netplan is the active tool (detected: $tool)."
+        fi
+        ;;
+      3) return 0 ;;
+      *) warn "Invalid choice." ;;
+    esac
+  done
+}
+
 show_system_status() {
   header "System Status"
   echo "  OS          : $OS_ID $OS_VERSION_ID ($OS_FAMILY)"
@@ -1092,16 +1153,18 @@ show_system_status() {
   echo "  Root SSH    : $(grep -E '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null || echo 'not set')"
   echo "  Sudoers file: $(sudoers_file) $([ -f "$(sudoers_file)" ] && echo '[exists]' || echo '[not found]')"
   echo
+  echo "  ── Netplan files ─────────────────────────────────────────────────"
+  local f
+  while IFS= read -r f; do
+    local tag="  "
+    [[ "$f" == *.disabled ]] && tag="${YEL}DIS${RESET}"
+    echo -e "    [${tag}] $f"
+  done < <(find /etc/netplan -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" -o -name "*.disabled" \) 2>/dev/null | sort)
+  echo
   echo "  ── Regular users (UID≥1000) ──────────────────────"
   _getent_passwd | awk -F: '$3>=1000 && $1!="nobody" && $1!="nfsnobody" {printf "  %-20s UID=%-6s HOME=%s\n",$1,$3,$6}'
   echo
 }
-
-# ─────────────────────────────────────────────────────────────
-# PACKAGE MANAGEMENT & UPDATES
-# FIX #1: Removed dead get_admin_tools_list() — install_admin_tools_bundle()
-#         uses nameref directly and is the single source of truth.
-# ─────────────────────────────────────────────────────────────
 
 ADMIN_TOOLS_debian=(
   net-tools curl wget nano vim htop tree
@@ -1111,7 +1174,6 @@ ADMIN_TOOLS_debian=(
   ufw fail2ban git openssl ca-certificates
 )
 
-# shellcheck disable=SC2034
 ADMIN_TOOLS_rhel=(
   net-tools curl wget nano vim htop tree
   iotop iftop nmap tcpdump traceroute
@@ -1120,7 +1182,6 @@ ADMIN_TOOLS_rhel=(
   firewalld fail2ban git openssl ca-certificates
 )
 
-# shellcheck disable=SC2034
 ADMIN_TOOLS_alpine=(
   net-tools curl wget nano vim htop tree
   iotop iftop nmap tcpdump traceroute
@@ -1129,7 +1190,6 @@ ADMIN_TOOLS_alpine=(
   git openssl ca-certificates
 )
 
-# shellcheck disable=SC2034
 ADMIN_TOOLS_opensuse=(
   net-tools curl wget nano vim htop tree
   iotop iftop nmap tcpdump traceroute
@@ -1138,7 +1198,6 @@ ADMIN_TOOLS_opensuse=(
   firewalld fail2ban git openssl ca-certificates
 )
 
-# shellcheck disable=SC2034
 ADMIN_TOOLS_arch=(
   net-tools curl wget nano vim htop tree
   iotop iftop nmap tcpdump traceroute
@@ -1147,7 +1206,6 @@ ADMIN_TOOLS_arch=(
   ufw fail2ban git openssl ca-certificates
 )
 
-# shellcheck disable=SC2034
 ADMIN_TOOLS_vyos=(
   net-tools curl wget nano vim htop
   tcpdump traceroute lsof tmux
@@ -1185,7 +1243,7 @@ install_admin_tools_bundle() {
     arch)        pacman -Sy --noconfirm >/dev/null 2>&1 || true ;;
   esac
 
-  info "Installing tools (each shown individually)..."
+  info "Installing tools..."
   echo
   local failed=() succeeded=()
 
@@ -1226,7 +1284,6 @@ install_custom_package() {
 install_multiple_custom_packages() {
   header "Install Multiple Packages"
   echo "  Enter package names separated by spaces or commas."
-  echo "  Example: nano curl git htop tmux"
   echo
 
   local raw
@@ -1329,13 +1386,12 @@ list_installed_packages() {
   esac
 }
 
-# FIX #14: package_management_menu uses consistent while-loop pattern
 package_management_menu() {
   while true; do
     header "Package Management  |  OS: $OS_ID ($OS_FAMILY)"
-    echo "  1) Install admin tool bundle   (net-tools, nano, vim, htop, nmap, tmux...)"
-    echo "  2) Install a single package    (you type the name)"
-    echo "  3) Install multiple packages   (space or comma separated)"
+    echo "  1) Install admin tool bundle"
+    echo "  2) Install a single package"
+    echo "  3) Install multiple packages"
     echo "  4) Remove a package"
     echo "  5) Search for a package"
     echo "  6) List installed packages"
@@ -1356,65 +1412,30 @@ package_management_menu() {
   done
 }
 
-# ─────────────────────────────────────────────────────────────
-# SYSTEM UPDATE MENU
-# ─────────────────────────────────────────────────────────────
-
 run_system_update() {
   header "Full System Update"
-  echo "  Steps:"
-  echo "    1. Refresh package index"
-  echo "    2. Upgrade all installed packages"
-  echo "    3. Clean up unused packages (where supported)"
-  echo
-
   read -r -p "  Proceed? [y/N]: " yn
   [[ "${yn,,}" == y ]] || { info "Canceled."; return 0; }
   echo
 
   case "$OS_FAMILY" in
     debian|vyos)
-      info "Running: apt-get update"
       apt-get update
-      info "Running: apt-get upgrade"
       DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-      info "Running: apt-get autoremove + autoclean"
       apt-get autoremove -y
       apt-get autoclean -y
       ;;
     rhel)
-      if command -v dnf &>/dev/null; then
-        info "Running: dnf update"
-        dnf update -y
-        info "Running: dnf autoremove"
-        dnf autoremove -y
-      else
-        info "Running: yum update"
-        yum update -y
-      fi
+      if command -v dnf &>/dev/null; then dnf update -y && dnf autoremove -y
+      else yum update -y; fi
       ;;
-    alpine)
-      info "Running: apk update + upgrade"
-      apk update
-      apk upgrade
-      ;;
-    opensuse)
-      info "Running: zypper refresh + update"
-      zypper --non-interactive refresh
-      zypper --non-interactive update
-      ;;
-    arch)
-      info "Running: pacman -Syu"
-      pacman -Syu --noconfirm
-      ;;
-    *)
-      err "Unsupported OS family for system update."
-      return 1
-      ;;
+    alpine)  apk update && apk upgrade ;;
+    opensuse) zypper --non-interactive refresh && zypper --non-interactive update ;;
+    arch)    pacman -Syu --noconfirm ;;
+    *)       err "Unsupported OS family for system update."; return 1 ;;
   esac
 
   ok "System update complete."
-  echo
 
   local needs_reboot=false
   [[ -f /var/run/reboot-required ]] && needs_reboot=true
@@ -1423,56 +1444,39 @@ run_system_update() {
   fi
 
   if $needs_reboot; then
-    warn "A reboot is required to apply kernel/system updates."
+    warn "A reboot is required."
     read -r -p "  Reboot now? [y/N]: " rb
-    [[ "${rb,,}" == y ]] && { ok "Rebooting..."; reboot; }
+    [[ "${rb,,}" == y ]] && reboot
   fi
 }
 
 check_updates_only() {
   header "Check Available Updates (dry run)"
-  info "Checking for updates — nothing will be installed."
-  echo
-
   case "$OS_FAMILY" in
     debian|vyos)
       apt-get update -qq
-      echo "  Packages with available upgrades:"
-      echo
       apt list --upgradable 2>/dev/null | grep -v "Listing..." | head -60 || true
       ;;
     rhel)
-      if command -v dnf &>/dev/null; then
-        dnf check-update 2>/dev/null || true
-      else
-        yum check-update 2>/dev/null || true
-      fi
+      if command -v dnf &>/dev/null; then dnf check-update 2>/dev/null || true
+      else yum check-update 2>/dev/null || true; fi
       ;;
-    alpine)
-      apk update -q
-      apk version -l '<' 2>/dev/null | head -60 || true
-      ;;
-    opensuse)
-      zypper --non-interactive refresh
-      zypper list-updates 2>/dev/null | head -60 || true
-      ;;
+    alpine)   apk update -q && apk version -l '<' 2>/dev/null | head -60 || true ;;
+    opensuse) zypper --non-interactive refresh && zypper list-updates 2>/dev/null | head -60 || true ;;
     arch)
       pacman -Sy --noconfirm >/dev/null 2>&1
-      local updates
-      updates="$(pacman -Qu 2>/dev/null | head -60 || true)"
+      local updates; updates="$(pacman -Qu 2>/dev/null | head -60 || true)"
       [[ -n "$updates" ]] && echo "$updates" || info "System is up to date."
       ;;
-    *)
-      err "Unsupported OS for update check."; return 1
-      ;;
+    *) err "Unsupported OS for update check."; return 1 ;;
   esac
 }
 
 update_menu() {
   while true; do
     header "System Update  |  OS: $OS_ID ($OS_FAMILY)"
-    echo "  1) Full system update      (refresh + upgrade all + cleanup)"
-    echo "  2) Check available updates (dry run — nothing installed)"
+    echo "  1) Full system update"
+    echo "  2) Check available updates (dry run)"
     echo "  3) Back"
     echo
 
@@ -1485,11 +1489,6 @@ update_menu() {
     esac
   done
 }
-
-
-# ─────────────────────────────────────────────────────────────
-# DHCP SERVER — AUTOMATED MULTI-NETWORK SETUP
-# ─────────────────────────────────────────────────────────────
 
 dhcp_get() {
   local key="$1"
@@ -1543,18 +1542,14 @@ ip_network() {
 suggest_range_start() {
   local network="$1" prefix="$2"
   local IFS='.' a b c d; read -r a b c d <<< "$network"
-  if (( prefix <= 24 )); then
-    printf "%d.%d.%d.50" "$a" "$b" "$c"
-  else
-    printf "%d.%d.%d.%d" "$a" "$b" "$c" $(( d + 10 ))
-  fi
+  if (( prefix <= 24 )); then printf "%d.%d.%d.50" "$a" "$b" "$c"
+  else printf "%d.%d.%d.%d" "$a" "$b" "$c" $(( d + 10 )); fi
 }
 
 suggest_range_end() {
   local network="$1" prefix="$2"
   local IFS='.' a b c d; read -r a b c d <<< "$network"
-  if (( prefix <= 24 )); then
-    printf "%d.%d.%d.200" "$a" "$b" "$c"
+  if (( prefix <= 24 )); then printf "%d.%d.%d.200" "$a" "$b" "$c"
   else
     local max=$(( (1 << (32 - prefix)) - 3 ))
     printf "%d.%d.%d.%d" "$a" "$b" "$c" $(( d + max ))
@@ -1595,7 +1590,7 @@ collect_subnet() {
 
   NET_SUBNET[$idx]="$network"
   NET_NETMASK[$idx]="$netmask"
-  NET_CIDR[$idx]="$prefix"   # FIX #2: store prefix here in collect_subnet
+  NET_CIDR[$idx]="$prefix"
 
   local def_start; def_start="$(suggest_range_start "$network" "$prefix")"
   local def_end;   def_end="$(suggest_range_end   "$network" "$prefix")"
@@ -1709,17 +1704,13 @@ HOST
   done
 }
 
-# FIX #2: build_vyos_dhcp_commands now receives subnet data as a serialized
-# argument string rather than relying on arrays from a different scope.
-# Arrays NET_* must still be in scope (declared in the calling function).
 build_vyos_dhcp_commands() {
   local num_nets="$1"
   local idx
   for (( idx=0; idx<num_nets; idx++ )); do
     local pool_name="POOL_${NET_SUBNET[$idx]//./_}"
-    local dns_vyos
-    dns_vyos="$(echo "${NET_DNS[$idx]}" | tr ',' ' ')"
-    local cidr="${NET_CIDR[$idx]}"   # now always populated from collect_subnet
+    local dns_vyos; dns_vyos="$(echo "${NET_DNS[$idx]}" | tr ',' ' ')"
+    local cidr="${NET_CIDR[$idx]}"
 
     echo "# ── Subnet $((idx+1)): ${NET_SUBNET[$idx]} on ${NET_IFACE[$idx]} ──"
     echo "set service dhcp-server shared-network-name '${pool_name}' subnet '${NET_SUBNET[$idx]}/${cidr}' default-router '${NET_ROUTER[$idx]}'"
@@ -1762,23 +1753,35 @@ install_dhcp_server_pkg() {
   }
 }
 
+# ── FIXED: handle commented-out lines and missing file ────────────────────
 apply_dhcp_interfaces_debian() {
   local iface_list="$1"
-  local iface_file; iface_file="${DHCP_IFACE_FILE_debian}"
+  local iface_file="${DHCP_IFACE_FILE_debian}"
 
-  [[ -f "$iface_file" ]] || return 0
+  # Create the file from scratch if it doesn't exist
+  if [[ ! -f "$iface_file" ]]; then
+    warn "$iface_file not found — creating it."
+    cat > "$iface_file" <<EOF
+# Defaults for isc-dhcp-server (sourced by systemd unit)
+INTERFACESv4="${iface_list}"
+INTERFACESv6=""
+EOF
+    ok "Created $iface_file → INTERFACESv4=\"$iface_list\""
+    return 0
+  fi
 
   cp -a "$iface_file" "${iface_file}.bak.$(date +%F-%H%M%S)"
 
-  if grep -q 'INTERFACESv4' "$iface_file"; then
-    sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${iface_list}\"/" "$iface_file"
-  elif grep -q 'INTERFACES=' "$iface_file"; then
-    sed -i "s/^INTERFACES=.*/INTERFACES=\"${iface_list}\"/" "$iface_file"
+  if grep -qE '^[#[:space:]]*INTERFACESv4=' "$iface_file"; then
+    # Replace even if it was commented out
+    sed -i -E "s|^[#[:space:]]*INTERFACESv4=.*|INTERFACESv4=\"${iface_list}\"|" "$iface_file"
+  elif grep -qE '^[#[:space:]]*INTERFACES=' "$iface_file"; then
+    sed -i -E "s|^[#[:space:]]*INTERFACES=.*|INTERFACES=\"${iface_list}\"|" "$iface_file"
   else
     echo "INTERFACESv4=\"${iface_list}\"" >> "$iface_file"
   fi
 
-  ok "Updated DHCP interfaces file: $iface_file → \"$iface_list\""
+  ok "Updated $iface_file → INTERFACESv4=\"$iface_list\""
 }
 
 enable_dhcp_service() {
@@ -1862,6 +1865,13 @@ show_dhcp_status() {
     echo
     cat "$conf"
   fi
+
+  # ── Also show the interfaces file so user can verify ──────────────────
+  echo
+  if [[ -f "${DHCP_IFACE_FILE_debian}" ]]; then
+    info "Interfaces file (${DHCP_IFACE_FILE_debian}):"
+    grep -v '^#' "${DHCP_IFACE_FILE_debian}" | grep -v '^$' || true
+  fi
 }
 
 remove_dhcp_server() {
@@ -1895,8 +1905,6 @@ remove_dhcp_server() {
 setup_dhcp_server() {
   header "DHCP Server Setup"
 
-  # FIX #2: declare all subnet arrays here so collect_subnet and
-  # build_dhcpd_conf / build_vyos_dhcp_commands share the same scope
   declare -a NET_IFACE NET_SUBNET NET_NETMASK NET_CIDR
   declare -a NET_RANGE_START NET_RANGE_END NET_ROUTER NET_DNS
   declare -a NET_DOMAIN NET_LEASE_DEF NET_LEASE_MAX NET_STATIC_HOSTS
@@ -1915,11 +1923,7 @@ setup_dhcp_server() {
   local num_nets=0
   while true; do
     collect_subnet "$num_nets" || return 1
-    # NET_CIDR[$num_nets] is now set inside collect_subnet — no re-derivation needed
-    # Use num_nets+=1 instead of (( num_nets++ )) to avoid set -e killing the script
-    # when num_nets is 0 (arithmetic result 0 = falsy = nonzero exit under set -e)
     num_nets=$(( num_nets + 1 ))
-
     echo
     read -r -p "  Add another subnet/interface? [y/N]: " more
     [[ "${more,,}" == y ]] || break
@@ -1952,12 +1956,14 @@ setup_dhcp_server() {
   echo "$conf_preview" > "$conf_file"
   ok "Config written → $conf_file"
 
-  if [[ "$OS_FAMILY" == "debian" ]]; then
+  # ── FIXED: always call apply_dhcp_interfaces on debian/vyos ───────────
+  if [[ "$OS_FAMILY" == "debian" || "$OS_FAMILY" == "vyos" ]]; then
     local iface_list=""
     local i
     for (( i=0; i<num_nets; i++ )); do
       iface_list+="${iface_list:+ }${NET_IFACE[$i]}"
     done
+    info "Binding DHCP service to interface(s): \"$iface_list\""
     apply_dhcp_interfaces_debian "$iface_list"
   fi
 
@@ -1967,11 +1973,10 @@ setup_dhcp_server() {
   ok "DHCP server is up and running!"
   echo
   info "Config file : $conf_file"
-  info "To view leases: choose 'View DHCP leases' in the DHCP menu."
+  info "Interfaces  : $(grep INTERFACESv4 ${DHCP_IFACE_FILE_debian} 2>/dev/null || echo 'see /etc/default/isc-dhcp-server')"
 }
 
 _setup_dhcp_vyos() {
-  # FIX #2: arrays declared here so build_vyos_dhcp_commands can access them
   declare -a NET_IFACE NET_SUBNET NET_NETMASK NET_CIDR
   declare -a NET_RANGE_START NET_RANGE_END NET_ROUTER NET_DNS
   declare -a NET_DOMAIN NET_LEASE_DEF NET_LEASE_MAX NET_STATIC_HOSTS
@@ -1979,7 +1984,6 @@ _setup_dhcp_vyos() {
   local num_nets=0
   while true; do
     collect_subnet "$num_nets" || return 1
-    # NET_CIDR[$num_nets] is set inside collect_subnet
     num_nets=$(( num_nets + 1 ))
     echo
     read -r -p "  Add another subnet? [y/N]: " more
@@ -2037,11 +2041,6 @@ dhcp_menu() {
   done
 }
 
-
-# ─────────────────────────────────────────────────────────────
-# MENUS
-# FIX #14: top-level menu() now loops internally, consistent with submenus
-# ─────────────────────────────────────────────────────────────
 user_management_menu() {
   while true; do
     header "User Management"
@@ -2074,7 +2073,7 @@ menu() {
     echo "  1) User management     (add / delete / SSH key)"
     echo "  2) Set hostname"
     echo "  3) Disable root SSH login"
-    echo "  4) Configure static network"
+    echo "  4) Configure network   (static IP / manage netplan files)"
     echo "  5) Package management  (install bundle / custom / remove / search)"
     echo "  6) System update       (upgrade all packages / check updates)"
     echo "  7) DHCP server         (install / multi-subnet wizard / leases)"
@@ -2092,7 +2091,7 @@ menu() {
       1)  user_management_menu ;;
       2)  set_hostname ;;
       3)  disable_root_ssh ;;
-      4)  configure_network ;;
+      4)  network_menu ;;
       5)  package_management_menu ;;
       6)  update_menu ;;
       7)  dhcp_menu ;;
@@ -2116,9 +2115,6 @@ menu() {
   done
 }
 
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
 main() {
   require_root
   detect_os
@@ -2132,9 +2128,7 @@ main() {
 
   if [[ "$OS_FAMILY" == "vyos" ]]; then
     echo
-    warn "VyOS detected. Some operations (network, hostname, SSH) will output"
-    warn "VyOS 'configure' mode commands rather than applying changes directly."
-    warn "Run those commands in configure mode for persistent config."
+    warn "VyOS detected. Some operations will output configure mode commands."
     echo
   fi
 
