@@ -21,6 +21,14 @@ DEFAULT_KEY_REL_PATH="RW01-jumper/debian/hamed_bar.pub"
 SUDOERS_DROPIN_NAME="classes"
 CONFIG_FILE="/etc/system-setup.conf"
 
+# Global arrays for DHCP subnet data — must be global so collect_subnet()
+# (child function) can populate them and setup_dhcp_server() can read them.
+# 'declare -a' inside a function creates local arrays — root cause of the
+# INTERFACESv4='1' bug.
+declare -a NET_IFACE=() NET_SUBNET=() NET_NETMASK=() NET_CIDR=()
+declare -a NET_RANGE_START=() NET_RANGE_END=() NET_ROUTER=() NET_DNS=()
+declare -a NET_DOMAIN=() NET_LEASE_DEF=() NET_LEASE_MAX=() NET_STATIC_HOSTS=()
+
 info()    { echo -e "${CYN}[INFO]${RESET}  $*"; }
 ok()      { echo -e "${GRN}[OK]${RESET}    $*"; }
 warn()    { echo -e "${YEL}[WARN]${RESET}  $*" >&2; }
@@ -484,9 +492,16 @@ install_git() {
 }
 
 get_machine_hostname() {
-  hostnamectl --static 2>/dev/null && return
-  [[ -r /etc/hostname ]] && tr -d '[:space:]' < /etc/hostname && return
-  hostname 2>/dev/null || echo "localhost"
+  local h
+  if command -v hostnamectl &>/dev/null; then
+    h="$(hostnamectl --static 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$h" ]] && { echo "$h"; return; }
+  fi
+  if [[ -r /etc/hostname ]]; then
+    h="$(tr -d '[:space:]' < /etc/hostname)"
+    [[ -n "$h" ]] && { echo "$h"; return; }
+  fi
+  hostname 2>/dev/null | tr -d '[:space:]' || echo "localhost"
 }
 get_short_hostname()   { local h; h="$(get_machine_hostname)"; echo "${h%%-*}"; }
 
@@ -796,7 +811,7 @@ detect_network_tool() {
 
 # ── LIST existing netplan files so user can pick one to edit ──────────────
 list_netplan_files() {
-  find /etc/netplan -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | sort
+  find /etc/netplan -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" -o -name "*.disabled" \) 2>/dev/null | sort
 }
 
 # ── NEW: interactive netplan file editor / selector ───────────────────────
@@ -815,9 +830,9 @@ manage_netplan_files() {
   echo
   local i
   for i in "${!files[@]}"; do
-    local status="active"
-    [[ "${files[$i]}" == *.disabled ]] && status="DISABLED"
-    printf "  %2d) %-55s [%s]\n" "$((i+1))" "${files[$i]}" "$status"
+    local fstatus="active"
+    [[ "${files[$i]}" == *.disabled ]] && fstatus="DISABLED"
+    printf "  %2d) %-55s [%s]\n" "$((i+1))" "${files[$i]}" "$fstatus"
   done
   echo "   0) Back"
   echo
@@ -832,66 +847,191 @@ manage_netplan_files() {
   echo
   echo "  Selected: ${BLD}$selected${RESET}"
   echo
-  echo "  a) View contents"
-  echo "  b) Edit with nano"
-  echo "  c) Disable (rename to .disabled)"
-  echo "  d) Enable  (remove .disabled suffix)"
-  echo "  e) Delete"
-  echo "  f) Back"
+  echo "  1) View contents"
+  echo "  2) Edit IPs via wizard  (re-prompts interface/IP/GW/DNS)"
+  echo "  3) Edit with nano       (raw YAML editor)"
+  echo "  4) Disable              (rename to .disabled)"
+  echo "  5) Enable               (remove .disabled suffix)"
+  echo "  6) Delete"
+  echo "  7) Back"
   echo
 
   local action
-  read -r -p "Action [a-f]: " action
-  case "${action,,}" in
-    a)
+  read -r -p "Action [1-7]: " action
+  case "$action" in
+    1)
       echo
       cat "$selected"
       ;;
-    b)
+
+    2)
+      # ── IP wizard: read existing values as defaults, re-prompt, rewrite ──
+      header "Edit Netplan File via Wizard: $(basename "$selected")"
+
+      # Parse existing values from YAML for smart defaults
+      local cur_iface cur_ip cur_gw cur_dns cur_search
+      cur_iface="$(grep -E '^\s+\w[^:]+:$' "$selected" 2>/dev/null \
+        | grep -vE '^\s+(network|version|ethernets|nameservers|routes|addresses|dhcp4|dhcp6):$' \
+        | awk '{gsub(/:$/,"",$1); print $1}' | head -1 || true)"
+      cur_ip="$(grep -E '^\s+- [0-9]' "$selected" 2>/dev/null \
+        | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | head -1 || true)"
+      cur_gw="$(grep -E 'via:' "$selected" 2>/dev/null \
+        | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+      cur_dns="$(grep -E 'addresses: \[' "$selected" 2>/dev/null \
+        | grep -Eo '([0-9]+\.){3}[0-9]+' | tr '\n' ',' | sed 's/,$//' || true)"
+      cur_search="$(grep 'search:' "$selected" 2>/dev/null \
+        | grep -Eo '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1 || true)"
+
+      # Show detected defaults
+      echo "  Detected current settings:"
+      echo "    Interface : ${cur_iface:-<not detected>}"
+      echo "    IP/CIDR   : ${cur_ip:-<not detected>}"
+      echo "    Gateway   : ${cur_gw:-<not detected>}"
+      echo "    DNS       : ${cur_dns:-<not detected>}"
+      echo "    Search    : ${cur_search:-<none>}"
+      echo
+
+      # Prompt — show detected value as default
+      local new_iface new_ip new_gw new_dns new_search
+
+      # Interface: numbered selection, with current as default hint
+      local _picked_iface
+      if prompt_select_iface _picked_iface "interface (currently: ${cur_iface:-unknown})"; then
+        new_iface="$_picked_iface"
+      else
+        # fallback: keep detected value if picker fails (e.g. only 1 iface)
+        new_iface="${cur_iface:-}"
+      fi
+      [[ -n "${new_iface// }" ]] || { err "Interface cannot be blank."; return 1; }
+      info "Using interface: $new_iface"
+
+      read -r -p "  IP/CIDR   [${cur_ip:-e.g. 192.168.1.10/24}]: " new_ip
+      new_ip="${new_ip:-$cur_ip}"
+      [[ -n "${new_ip// }" ]] || { err "IP/CIDR cannot be blank — could not detect from file."; return 1; }
+      valid_cidr "$new_ip" || { err "Invalid IP/CIDR: $new_ip"; return 1; }
+
+      read -r -p "  Gateway   [${cur_gw:-e.g. 192.168.1.1}]: " new_gw
+      new_gw="${new_gw:-$cur_gw}"
+      [[ -n "${new_gw// }" ]] || { err "Gateway cannot be blank — could not detect from file."; return 1; }
+      valid_ipv4 "$new_gw" || { err "Invalid gateway: $new_gw"; return 1; }
+
+      read -r -p "  DNS       [${cur_dns:-e.g. 8.8.8.8,8.8.4.4}]: " new_dns
+      new_dns="${new_dns:-$cur_dns}"
+      [[ -n "${new_dns// }" ]] || { err "DNS cannot be blank — could not detect from file."; return 1; }
+
+      read -r -p "  Search domain [${cur_search:-Enter=skip}]: " new_search
+      new_search="${new_search:-$cur_search}"
+      new_search="$(echo "${new_search:-}" | tr -dc 'a-zA-Z0-9.-')"
+
+      local new_dns_list; new_dns_list="$(dns_to_list "$new_dns" ", ")"
+
+      echo
+      echo "  ── New settings ────────────────────────"
+      echo "  Interface : $new_iface"
+      echo "  IP/CIDR   : $new_ip"
+      echo "  Gateway   : $new_gw"
+      echo "  DNS       : $new_dns_list"
+      echo "  Search    : ${new_search:-<none>}"
+      echo "  File      : $selected"
+      echo "  ────────────────────────────────────────"
+      echo
+
+      read -r -p "  Write and apply? [y/N]: " yn
+      [[ "${yn,,}" == y ]] || { info "Canceled."; return 0; }
+
+      # Back up old file
+      cp -a "$selected" "${selected}.bak.$(date +%F-%H%M%S)"
+
+      # Rewrite the file
+      {
+        cat <<YAML
+network:
+  version: 2
+  ethernets:
+    ${new_iface}:
+      dhcp4: false
+      addresses:
+        - ${new_ip}
+      routes:
+        - to: default
+          via: ${new_gw}
+      nameservers:
+        addresses: [${new_dns_list}]
+YAML
+        [[ -n "${new_search// }" ]] && echo "        search: [${new_search}]"
+      } > "$selected"
+
+      chmod 600 "$selected"
+
+      # Disable any OTHER files that reference this interface
+      local ef
+      while IFS= read -r ef; do
+        [[ "$ef" == "$selected" ]] && continue
+        if grep -q "$new_iface" "$ef" 2>/dev/null; then
+          mv "$ef" "${ef}.disabled"
+          warn "Disabled conflicting file: $(basename "$ef")"
+        fi
+      done < <(find /etc/netplan -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null)
+
+      netplan generate && netplan apply && ok "Netplan applied." \
+        || err "netplan apply failed — check $selected"
+      ;;
+
+    3)
       if command -v nano &>/dev/null; then
         nano "$selected"
         read -r -p "Run 'netplan apply' now? [y/N]: " yn
         if [[ "${yn,,}" == y ]]; then
-          netplan generate && netplan apply && ok "Netplan applied." || err "netplan apply failed — check the file."
+          if netplan generate && netplan apply; then
+            ok "Netplan applied."
+          else
+            err "netplan apply failed — check $selected"
+          fi
         fi
       else
-        err "nano not found. Install it first (Package Management → install nano)."
+        err "nano not found. Install it first via Package Management."
       fi
       ;;
-    c)
+    4)
       if [[ "$selected" == *.disabled ]]; then
         info "Already disabled."
       else
         mv "$selected" "${selected}.disabled"
         ok "Disabled: ${selected}.disabled"
         read -r -p "Run 'netplan apply' now? [y/N]: " yn
-        [[ "${yn,,}" == y ]] && netplan generate && netplan apply && ok "Applied." || true
+        if [[ "${yn,,}" == y ]]; then
+          if netplan generate && netplan apply; then ok "Applied."; else err "netplan apply failed."; fi
+        fi
       fi
       ;;
-    d)
+    5)
       if [[ "$selected" == *.disabled ]]; then
         local enabled="${selected%.disabled}"
         mv "$selected" "$enabled"
         ok "Enabled: $enabled"
         read -r -p "Run 'netplan apply' now? [y/N]: " yn
-        [[ "${yn,,}" == y ]] && netplan generate && netplan apply && ok "Applied." || true
+        if [[ "${yn,,}" == y ]]; then
+          if netplan generate && netplan apply; then ok "Applied."; else err "netplan apply failed."; fi
+        fi
       else
         info "File is already active (not .disabled)."
       fi
       ;;
-    e)
+    6)
       read -r -p "  Delete '$selected'? This cannot be undone. [y/N]: " yn
       if [[ "${yn,,}" == y ]]; then
         rm -f "$selected"
         ok "Deleted: $selected"
         read -r -p "Run 'netplan apply' now? [y/N]: " yn2
-        [[ "${yn2,,}" == y ]] && netplan generate && netplan apply && ok "Applied." || true
+        if [[ "${yn2,,}" == y ]]; then
+          if netplan generate && netplan apply; then ok "Applied."; else err "netplan apply failed."; fi
+        fi
       else
         info "Canceled."
       fi
       ;;
-    f) return 0 ;;
-    *) warn "Unknown action." ;;
+    7) return 0 ;;
+    *) warn "Invalid choice." ;;
   esac
 }
 
@@ -1062,10 +1202,9 @@ EOF
 }
 
 collect_network_inputs() {
-  local def_if; def_if="$(default_iface)"
-  read -r -p "Interface [${def_if:-NONE}]: " iface
-  iface="${iface:-$def_if}"
-  [[ -n "${iface:-}" ]] || { err "Could not determine interface."; return 1; }
+  local iface
+  prompt_select_iface iface "interface to configure" || return 1
+  info "Using interface: $iface"
 
   local ipcidr gw dns search
   read -r -p "Static IP/CIDR (e.g. 10.0.5.93/24): " ipcidr
@@ -1225,9 +1364,10 @@ install_admin_tools_bundle() {
   local i=0
   for t in "${tools[@]}"; do
     printf "    %-25s" "$t"
-    (( ++i % 3 == 0 )) && echo
+    i=$(( i + 1 ))
+    (( i % 3 == 0 )) && echo || true
   done
-  [[ $(( i % 3 )) -ne 0 ]] && echo
+  (( i % 3 != 0 )) && echo || true
   echo
 
   read -r -p "  Proceed with installation? [y/N]: " yn
@@ -1509,7 +1649,12 @@ dhcp_get() {
     opensuse:CONF_DIR)      echo "/etc" ;;
     arch:CONF_DIR)          echo "/etc" ;;
     *:CONF_DIR)             echo "/etc/dhcp" ;;
-    *:LEASES)               echo "/var/lib/dhcpd/dhcpd.leases" ;;
+    debian:LEASES|vyos:LEASES)  echo "/var/lib/dhcp/dhcpd.leases" ;;
+    rhel:LEASES)                echo "/var/lib/dhcpd/dhcpd.leases" ;;
+    alpine:LEASES)              echo "/var/lib/dhcpd/dhcpd.leases" ;;
+    opensuse:LEASES)            echo "/var/lib/dhcpd/dhcpd.leases" ;;
+    arch:LEASES)                echo "/var/lib/dhcpd/dhcpd.leases" ;;
+    *:LEASES)                   echo "/var/lib/dhcp/dhcpd.leases" ;;
     *) echo "" ;;
   esac
 }
@@ -1563,21 +1708,44 @@ list_interfaces() {
     | sed 's/@.*//'
 }
 
+# ── Shared helper: numbered interface picker ──────────────────────────────
+# Usage: prompt_select_iface <varname> [label]
+# Writes chosen interface name into <varname>. Returns 1 on failure/cancel.
+prompt_select_iface() {
+  local _psv="$1"
+  local _label="${2:-interface}"
+  local _ifaces=()
+  mapfile -t _ifaces < <(list_interfaces)
+
+  if [[ "${#_ifaces[@]}" -eq 0 ]]; then
+    err "No network interfaces detected."
+    return 1
+  fi
+
+  echo
+  echo "  Available interfaces:"
+  local _i
+  for _i in "${!_ifaces[@]}"; do
+    printf "    %d) %s\n" "$((_i+1))" "${_ifaces[$_i]}"
+  done
+  echo
+
+  local _choice
+  read -r -p "  Select ${_label} [1-${#_ifaces[@]}]: " _choice
+  [[ "$_choice" =~ ^[0-9]+$ ]]                           || { err "Invalid input."; return 1; }
+  (( _choice >= 1 && _choice <= ${#_ifaces[@]} ))        || { err "Out of range."; return 1; }
+
+  printf -v "$_psv" '%s' "${_ifaces[$((_choice-1))]}"
+}
+
 collect_subnet() {
   local idx="$1"
   echo
   echo -e "${BLD}${CYN}  ── Subnet #$((idx+1)) ──────────────────────────────────────${RESET}"
 
-  echo "  Available interfaces:"
-  local ifaces; mapfile -t ifaces < <(list_interfaces)
-  local i
-  for i in "${!ifaces[@]}"; do
-    printf "    %d) %s\n" "$((i+1))" "${ifaces[$i]}"
-  done
-  echo
   local iface
-  read -r -p "  Interface for this subnet [e.g. eth0]: " iface
-  [[ -n "${iface// }" ]] || { err "Interface cannot be blank."; return 1; }
+  prompt_select_iface iface "interface for this subnet" || return 1
+  info "Using interface: $iface"
   NET_IFACE[$idx]="$iface"
 
   local srv_cidr
@@ -1753,6 +1921,93 @@ install_dhcp_server_pkg() {
   }
 }
 
+# ── DHCP firewall: open UDP 67 (server) and UDP 68 (client) ──────────────
+# Checks for firewalld first, installs it if absent, then falls back to
+# ufw, then iptables as a last resort.
+open_dhcp_firewall() {
+  header "Firewall — Opening DHCP Ports (UDP 67/68)"
+
+  # ── 1. firewalld ──────────────────────────────────────────────────────
+  if command -v firewall-cmd &>/dev/null; then
+    info "firewalld detected — already installed."
+  else
+    info "firewalld not found — installing..."
+    if pkg_install firewalld 2>/dev/null; then
+      ok "firewalld installed."
+      # Enable + start it
+      if command -v systemctl &>/dev/null; then
+        systemctl enable --now firewalld
+        ok "firewalld enabled and started."
+      fi
+    else
+      warn "Could not install firewalld — will try ufw/iptables fallback."
+    fi
+  fi
+
+  if command -v firewall-cmd &>/dev/null; then
+    # Make sure the service is running before we query it
+    if ! firewall-cmd --state &>/dev/null 2>&1; then
+      info "Starting firewalld..."
+      systemctl start firewalld 2>/dev/null || rc-service firewalld start 2>/dev/null || true
+    fi
+
+    # Add the dhcp service (covers UDP 67) permanently
+    if firewall-cmd --query-service=dhcp --permanent &>/dev/null 2>&1; then
+      info "firewalld: dhcp service already open."
+    else
+      firewall-cmd --add-service=dhcp --permanent
+      ok "firewalld: added dhcp service (UDP 67) permanently."
+    fi
+
+    # Also explicitly open UDP 68 (BOOTP client) in case the service def omits it
+    if firewall-cmd --query-port=68/udp --permanent &>/dev/null 2>&1; then
+      info "firewalld: UDP 68 already open."
+    else
+      firewall-cmd --add-port=68/udp --permanent
+      ok "firewalld: opened UDP 68 permanently."
+    fi
+
+    firewall-cmd --reload
+    ok "firewalld reloaded — DHCP ports open."
+    return 0
+  fi
+
+  # ── 2. ufw fallback ───────────────────────────────────────────────────
+  if command -v ufw &>/dev/null; then
+    info "ufw detected — opening UDP 67/68..."
+    ufw allow 67/udp comment "DHCP server"  2>/dev/null || true
+    ufw allow 68/udp comment "DHCP client"  2>/dev/null || true
+    ufw --force enable 2>/dev/null || true
+    ok "ufw: UDP 67/68 allowed."
+    return 0
+  fi
+
+  # ── 3. iptables last resort ───────────────────────────────────────────
+  if command -v iptables &>/dev/null; then
+    info "iptables detected — adding UDP 67/68 rules..."
+    iptables -C INPUT -p udp --dport 67 -j ACCEPT &>/dev/null 2>&1 || \
+      iptables -I INPUT -p udp --dport 67 -j ACCEPT
+    iptables -C INPUT -p udp --dport 68 -j ACCEPT &>/dev/null 2>&1 || \
+      iptables -I INPUT -p udp --dport 68 -j ACCEPT
+
+    # Persist if possible
+    if command -v iptables-save &>/dev/null; then
+      if [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4
+        ok "iptables rules saved to /etc/iptables/rules.v4"
+      elif [[ -d /etc/sysconfig ]]; then
+        iptables-save > /etc/sysconfig/iptables
+        ok "iptables rules saved to /etc/sysconfig/iptables"
+      fi
+    fi
+    ok "iptables: UDP 67/68 allowed."
+    return 0
+  fi
+
+  warn "No supported firewall tool found (firewalld/ufw/iptables)."
+  warn "Manually open UDP 67 and UDP 68 on this host."
+}
+
 # ── FIXED: handle commented-out lines and missing file ────────────────────
 apply_dhcp_interfaces_debian() {
   local iface_list="$1"
@@ -1905,20 +2160,21 @@ remove_dhcp_server() {
 setup_dhcp_server() {
   header "DHCP Server Setup"
 
-  declare -a NET_IFACE NET_SUBNET NET_NETMASK NET_CIDR
-  declare -a NET_RANGE_START NET_RANGE_END NET_ROUTER NET_DNS
-  declare -a NET_DOMAIN NET_LEASE_DEF NET_LEASE_MAX NET_STATIC_HOSTS
+  # Reset global subnet arrays for a fresh run
+  NET_IFACE=(); NET_SUBNET=(); NET_NETMASK=(); NET_CIDR=()
+  NET_RANGE_START=(); NET_RANGE_END=(); NET_ROUTER=(); NET_DNS=()
+  NET_DOMAIN=(); NET_LEASE_DEF=(); NET_LEASE_MAX=(); NET_STATIC_HOSTS=()
 
   if [[ "$OS_FAMILY" == "vyos" ]]; then
     _setup_dhcp_vyos
     return $?
   fi
 
-  echo "  Step 1/4 — Install DHCP server package"
+  echo "  Step 1/5 — Install DHCP server package"
   install_dhcp_server_pkg || return 1
 
   echo
-  echo "  Step 2/4 — Define subnets"
+  echo "  Step 2/5 — Define subnets"
   echo
   local num_nets=0
   while true; do
@@ -1930,7 +2186,7 @@ setup_dhcp_server() {
   done
 
   echo
-  echo "  Step 3/4 — Review configuration"
+  echo "  Step 3/5 — Review configuration"
   echo
   echo -e "${BLD}  ════ DHCP Configuration Preview ════${RESET}"
   local conf_preview
@@ -1942,7 +2198,7 @@ setup_dhcp_server() {
   [[ "${yn,,}" == y ]] || { info "Canceled — nothing written."; return 0; }
 
   echo
-  echo "  Step 4/4 — Applying configuration"
+  echo "  Step 4/5 — Applying configuration"
 
   local conf_file; conf_file="$(dhcp_get CONF_FILE)"
   local conf_dir;  conf_dir="$(dhcp_get CONF_DIR)"
@@ -1956,7 +2212,7 @@ setup_dhcp_server() {
   echo "$conf_preview" > "$conf_file"
   ok "Config written → $conf_file"
 
-  # ── FIXED: always call apply_dhcp_interfaces on debian/vyos ───────────
+  # ── always set interface binding on debian/vyos ───────────────────────
   if [[ "$OS_FAMILY" == "debian" || "$OS_FAMILY" == "vyos" ]]; then
     local iface_list=""
     local i
@@ -1970,6 +2226,10 @@ setup_dhcp_server() {
   enable_dhcp_service
 
   echo
+  echo "  Step 5/5 — Firewall"
+  open_dhcp_firewall
+
+  echo
   ok "DHCP server is up and running!"
   echo
   info "Config file : $conf_file"
@@ -1977,9 +2237,10 @@ setup_dhcp_server() {
 }
 
 _setup_dhcp_vyos() {
-  declare -a NET_IFACE NET_SUBNET NET_NETMASK NET_CIDR
-  declare -a NET_RANGE_START NET_RANGE_END NET_ROUTER NET_DNS
-  declare -a NET_DOMAIN NET_LEASE_DEF NET_LEASE_MAX NET_STATIC_HOSTS
+  # Reset global subnet arrays
+  NET_IFACE=(); NET_SUBNET=(); NET_NETMASK=(); NET_CIDR=()
+  NET_RANGE_START=(); NET_RANGE_END=(); NET_ROUTER=(); NET_DNS=()
+  NET_DOMAIN=(); NET_LEASE_DEF=(); NET_LEASE_MAX=(); NET_STATIC_HOSTS=()
 
   local num_nets=0
   while true; do
