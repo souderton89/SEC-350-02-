@@ -96,7 +96,7 @@ set nat source rule 30 translation address 'masquerade'
 set protocols rip network '172.16.50.0/29'
 set protocols rip network '172.16.200.0/28'
 set protocols static route 0.0.0.0/0 next-hop 10.0.17.2
-set protocols static route 0.0.0.0/0 next-hop 172.16.150.2
+
 set protocols static route 172.16.200.0/28 next-hop 172.16.150.3
 set service dns forwarding allow-from '172.16.50.0/29'
 set service dns forwarding allow-from '172.16.150.0/24'
